@@ -69,7 +69,7 @@ PKQINV FOOBAR Example Data
 - **[Data]**：（可选）传递给操作的参数。
 
 **可视化说明**：
-```plaintext
+```mermaid
 block-beta  
   columns 4  
   PKQ INV FOOBAR data["Example Data"]  
@@ -104,7 +104,7 @@ PKR200 !DATA" Example Data
 - **[Data]**：实际传输的数据内容。
 
 **可视化说明**：
-```plaintext
+```mermaid
 block-beta  
   columns 4  
   PKR 200 number["!DATA#quot;"] data["Example Data"]  
