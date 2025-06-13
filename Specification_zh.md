@@ -91,21 +91,21 @@ sequenceDiagram
     participant D as 设备 (Device)
     H->>D: !!START
     D->>H: !!ACKNO START
-    H->>D: !"SENDV VARIA
-    D->>H: !"ACKNO SENDV
-    H->>D: !#35;SDATA SENDV [data part 1]
+    H->>D: !"INVOK VARIA
+    D->>H: !"ACKNO INVOK
+    H->>D: !#35;SDATA INVOK [data part 1]
     D->>H: !#35;ACKNO SDATA
-    H->>D: !$SDATA SENDV [data part 2]
+    H->>D: !$SDATA INVOK [data part 2]
     D->>H: !$ACKNO SDATA
     H->>D: !%ENDTR
     D->>H: !%ACKNO ENDTR
     H->>D: !&QUERY
     D->>H: !&ACKNO QUERY
-    D->>H: !'RTURN SENDV
+    D->>H: !'RTURN INVOK
     H->>D: !'ACKNO RTURN
-    D->>H: !(SDATA [returning data part 1]
+    D->>H: !(SDATA INVOK [returning data part 1]
     H->>D: !(ACKNO SDATA
-    D->>H: !)SDATA [returning data part 2]
+    D->>H: !)SDATA INVOK [returning data part 2]
     H->>D: !)ACKNO SDATA
     D->>H: !*ENDTR
     H->>D: !*ACKNO ENDTR

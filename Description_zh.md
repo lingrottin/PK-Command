@@ -188,9 +188,9 @@ sequenceDiagram
     R->>S: !&ACKNO QUERY
     R->>S: !'RTURN INVOK
     S->>R: !'ACKNO RTURN
-    S->>R: !#40;SDATA [returning data part 1]
+    S->>R: !#40;SDATA INVOK [returning data part 1]
     R->>S: !#40;ACKNO SDATA
-    S->>R: !#41;SDATA [returning data part 2]
+    S->>R: !#41;SDATA INVOK [returning data part 2]
     R->>S: !#41;ACKNO SDATA
     S->>R: !#42;ENDTR
     R->>S: !#42;ACKNO ENDTR
@@ -214,9 +214,9 @@ sequenceDiagram
     R->>S: !%ACKNO QUERY
     R->>S: !&RTURN REQUV
     S->>R: !&ACKNO RTURN
-    S->>R: !'SDATA [returning data part 1]
+    S->>R: !'SDATA REQUV [returning data part 1]
     R->>S: !'ACKNO SDATA
-    S->>R: !(SDATA [returning data part 2]
+    S->>R: !(SDATA REQUV [returning data part 2]
     R->>S: !(ACKNO SDATA
     S->>R: !)ENDTR
     R->>S: !)ACKNO ENDTR
