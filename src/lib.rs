@@ -1,289 +1,68 @@
 use std::cell::{Cell, RefCell};
-use std::fmt;
-use std::time::Instant;
+use std::future::Future; // Import Future trait
+use std::pin::Pin;
+use std::task::{Context, Poll}; // Import Context and Poll
+use std::time::{Duration, Instant};
+
+mod types;
 mod util;
+use types::{Command, Operation, Role, Stage, Status};
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Operation {
-    SendVariable,    // SENDV
-    RequireVariable, // REQUV
-    Invoke,          // INVOK
-    GetVersion,      // PKVER
-    Start,           // START
-    EndTransmission, // ENDTR
-    Acknowledge,     // ACKNO
-    Query,           // QUERY
-    Return,          // RTURN
-    Empty,           // EMPTY
-    Data,            // SDATA
-    Await,           // AWAIT
-    Error,           // ERROR
+pub use util::{PkMHashmapWrapper, PkVHashmapWrapper};
+
+pub trait PkVariableAccessor {
+    fn get(&self, key: String) -> Option<Vec<u8>>;
+    fn set(&self, key: String, value: Vec<u8>) -> Result<(), String>;
 }
 
-impl Operation {
-    fn to_name(&self) -> &'static str {
-        match self {
-            Operation::SendVariable => "SENDV",
-            Operation::RequireVariable => "REQUV",
-            Operation::Invoke => "INVOK",
-            Operation::GetVersion => "PKVER",
-            Operation::Start => "START",
-            Operation::EndTransmission => "ENDTR",
-            Operation::Acknowledge => "ACKNO",
-            Operation::Query => "QUERY",
-            Operation::Return => "RTURN",
-            Operation::Empty => "EMPTY",
-            Operation::Data => "SDATA",
-            Operation::Await => "AWAIT",
-            Operation::Error => "ERROR",
-        }
-    }
-
-    fn from_name(name: &str) -> Option<Operation> {
-        match name {
-            "SENDV" => Some(Operation::SendVariable),
-            "REQUV" => Some(Operation::RequireVariable),
-            "INVOK" => Some(Operation::Invoke),
-            "PKVER" => Some(Operation::GetVersion),
-            "START" => Some(Operation::Start),
-            "ENDTR" => Some(Operation::EndTransmission),
-            "ACKNO" => Some(Operation::Acknowledge),
-            "QUERY" => Some(Operation::Query),
-            "RTURN" => Some(Operation::Return),
-            "EMPTY" => Some(Operation::Empty),
-            "SDATA" => Some(Operation::Data),
-            "AWAIT" => Some(Operation::Await),
-            "ERROR" => Some(Operation::Error),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Command {
-    msg_id: u16,
-    operation: Operation,
-    object: Option<String>,
-    data: Option<String>,
-}
-
-impl Command {
-    fn parse(msg: &str) -> Result<Command, &'static str> {
-        // 1. 检查最小长度
-        if msg.len() < 7 {
-            return Err("Invalid length: message is too short.");
-        }
-
-        // 2. 解析 MSG ID (使用 .get() 更安全)
-        let msg_id_str = msg.get(0..2).ok_or("Failed to slice MSG ID")?;
-
-        // 3. 特殊处理 ERROR 指令
-        if msg_id_str == "  " {
-            // 检查 `ERROR ERROR` 或 `ACKNO ERROR` 结构
-            if (msg.get(2..7) != Some("ACKNO")
-                || msg.get(7..8) != Some(" ")
-                || msg.get(8..13) != Some("ERROR"))
-                || (msg.get(2..7) != Some("ERROR")
-                    || msg.get(7..8) != Some(" ")
-                    || msg.get(8..13) != Some("ERROR"))
-            {
-                return Err("Invalid ERROR command format.");
-            }
-
-            let data = if msg.len() > 14 {
-                // 检查数据前的空格
-                if msg.get(13..14) != Some(" ") {
-                    return Err("Missing space before data in ERROR command.");
-                }
-                Some(String::from(msg.get(14..).unwrap()))
-            } else if msg.len() == 13 {
-                None
-            } else {
-                return Err("Invalid length for ERROR command.");
-            };
-
-            return Ok(Command {
-                msg_id: 0, // ERROR 指令的 ID 通常不使用，可以设为 0
-                operation: if msg.get(2..7) == Some("ACKNO") {
-                    Operation::Acknowledge
-                } else {
-                    Operation::Error
-                },
-                object: Some("ERROR".to_string()), // 根据协议，对象是 "ERROR"
-                data,
-            });
-        }
-
-        // 4. 处理常规指令
-        let msg_id = util::msg_id::to_u16(msg_id_str).map_err(|_| "Invalid MSG ID format.")?;
-
-        let op_name = msg.get(2..7).ok_or("Failed to slice operation name.")?;
-        let operation = Operation::from_name(op_name).ok_or("Unrecognized operation name.")?;
-
-        // 5. 根据长度和分隔符判断 object 和 data
-        let (object, data) = match msg.len() {
-            // 只有 MSG ID 和 OP NAME
-            7 => (None, None),
-
-            // 包含 OBJECT
-            13 => {
-                if msg.get(7..8) != Some(" ") {
-                    return Err("Missing space after operation name.");
-                }
-                let obj_str = msg.get(8..13).ok_or("Failed to slice object.")?;
-                (Some(String::from(obj_str)), None)
-            }
-
-            // 包含 OBJECT 和 DATA
-            len if len > 14 => {
-                if msg.get(7..8) != Some(" ") || msg.get(13..14) != Some(" ") {
-                    return Err("Missing space separator for object or data.");
-                }
-                let obj_str = msg.get(8..13).ok_or("Failed to slice object.")?;
-                let data_str = msg.get(14..).unwrap(); // unwrap is safe due to length check
-                (Some(String::from(obj_str)), Some(String::from(data_str)))
-            }
-
-            // 其他所有长度都是无效的
-            _ => return Err("Invalid message length."),
-        };
-
-        Ok(Command {
-            msg_id,
-            operation,
-            object,
-            data,
-        })
-    }
-}
-
-impl fmt::Display for Command {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // from_u16 应该返回 Result<String, _>
-        // 这里我们假设它返回 Result<String, &str>
-        let id = match self.operation {
-            Operation::Error => String::from("  "),
-            // ERROR 指令的 ACKNO 的 id 也固定是两个空格
-            Operation::Acknowledge => {
-                if self.object == Some(String::from("ERROR")) {
-                    String::from("  ")
-                } else {
-                    util::msg_id::from_u16(self.msg_id).map_err(|_| fmt::Error)?
-                }
-            }
-            _ => util::msg_id::from_u16(self.msg_id).map_err(|_| fmt::Error)?, // 将自定义错误转换为 fmt::Error
-        };
-
-        let op = self.operation.to_name();
-
-        // write! 宏是实现 Display 的标准方式，它类似于 format!
-        // 但将结果写入 Formatter
-        write!(f, "{}{}", id, op)?;
-
-        if let Some(obj) = &self.object {
-            write!(f, " {}", obj)?;
-            if let Some(data) = &self.data {
-                write!(f, " {}", data)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-// 指示当前收发指令方的特定状态
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Status {
-    Idle,           // 空闲状态（不在链内）
-    Active,         // 等待对方的指令
-    AwaitingAck,    // 等待 ACK
-    AwaitingErrAck, // 等待 ACK（发送 ERROR 后）
-    ReceivingData,  // 正在接收数据
-    SendingData,    // 正在发送数据
-}
-
-// 指示当前“链”的状态（传输阶段）
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Stage {
-    Idle,
-    Started,               // 已发出/收到 START 指令
-    RootOperationAssigned, // 已发出/收到根指令,等待发送参数
-    SendingParameter,      // 正在传输参数
-    ParameterSent,         // 已传输第一个“ENDTR”，等待 QUERY
-    SendingResponse,       // 正在传输返回值
-}
-
-impl Stage {
-    fn from_int(int: u8) -> Stage {
-        match int {
-            0 => Self::Idle,
-            1 => Self::Started,
-            2 => Self::RootOperationAssigned,
-            3 => Self::SendingParameter,
-            4 => Self::ParameterSent,
-            5 => Self::SendingResponse,
-            _ => panic!("Out-of-bound integer equivalent for Stage"),
-        }
-    }
-
-    fn to_int(&self) -> u8 {
-        match self {
-            Self::Idle => 0,
-            Self::Started => 1,
-            Self::RootOperationAssigned => 2,
-            Self::SendingParameter => 3,
-            Self::ParameterSent => 4,
-            Self::SendingResponse => 5,
-        }
-    }
-    fn increment(&mut self) -> () {
-        *self = *self + 1_u8;
-    }
-}
-
-impl std::ops::Add<u8> for Stage {
-    type Output = Self;
-    fn add(self, other: u8) -> Stage {
-        let int = self.to_int();
-        let ret = int + other;
-        if int + other >= 6 {
-            return Self::Idle;
-        }
-        Self::from_int(ret)
-    }
+pub trait PkMethodAccessor {
+    fn call(
+        &self,
+        key: String,
+        param: Vec<u8>,
+    ) -> Result<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>, String>;
 }
 
 pub struct PkCommandConfig {
-    ack_timeout: u64,
-    inter_command_timeout: u64,
-    await_interval: u64,
+    ack_timeout: Duration,
+    inter_command_timeout: Duration,
+    await_interval: Duration,
+    packet_limit: u64, // 一个包的最大长度
+    pk_version: &'static str,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Role {
-    Host,   // 调用方（不一定是主机）
-    Device, // 接收方（不一定是设备）
-    Idle,   // （空闲期没有角色）
-}
-
-pub struct PkCommand {
+pub struct PkCommand<VA, MA>
+where
+    VA: PkVariableAccessor,
+    MA: PkMethodAccessor,
+{
     stage: Cell<Stage>,
     status: Cell<Status>,
     role: Cell<Role>,
     last_sent_command: RefCell<Command>,
     last_sent_msg_id: Cell<u16>,
-    data_buffer: Vec<u8>,
+    last_received_msg_id: Cell<u16>, // ID of the last valid command received from the other side
+    data_param: RefCell<Vec<u8>>,
+    data_return: RefCell<Vec<u8>>,
+    sending_data_progress: Cell<u64>,
     root_operation: Cell<Operation>,
-    root_object: RefCell<String>,
+    root_object: RefCell<Option<String>>,
     command_buffer: RefCell<Command>, // 收到的指令
-    command_processed: Cell<bool>,    // “收到的命令”是否已在上次 poll 处理完毕
+    command_processed: Cell<bool>,    // “command_buffer”中的命令是否已在上次 poll 处理完毕
     last_command_time: Cell<Instant>, // 上次收到/发出命令的时间
+    // For Device role during INVOK/REQUV response phase:
+    device_op_pending: Cell<bool>, // True if Device is executing an INVOK/REQUV and app hasn't provided result
+    device_await_deadline: Cell<Option<Instant>>, // When the next AWAIT should be sent if op is still pending
     config: PkCommandConfig,
+    variable_accessor: VA,
+    method_accessor: MA,
+    pending_future: RefCell<Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>>>,
 }
 
-impl PkCommand {
-    pub fn incoming_command(&self, command: String) -> Result<(), &'static str> {
-        match Command::parse(&*command) {
+impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
+    pub fn incoming_command(&self, command_bytes: Vec<u8>) -> Result<(), &'static str> {
+        match Command::parse(&command_bytes) {
+            // Pass as slice
             Ok(parsed_command) => {
                 self.command_buffer.replace(parsed_command);
                 self.command_processed.set(false);
@@ -294,53 +73,191 @@ impl PkCommand {
         }
     }
 
+    fn slice_data(&self, role: Role) -> Result<(Vec<u8>, bool), &'static str> {
+        // 如果 Role 是 Device 则默认在发送返回值，反之亦然
+        match role {
+            Role::Device => {
+                let data = self.data_return.borrow();
+                if data.len() == 0 {
+                    return Err("No return data to slice.");
+                }
+                let start = self.sending_data_progress.get() as usize;
+                let end =
+                    std::cmp::min(start + (self.config.packet_limit - 14) as usize, data.len());
+                let is_last_packet = end == data.len();
+                self.sending_data_progress.set(end as u64);
+                Ok((data[start..end].to_vec(), is_last_packet))
+            }
+            Role::Host => {
+                let data = self.data_param.borrow();
+                if data.len() == 0 {
+                    return Err("No parameter data to slice.");
+                }
+                let start = self.sending_data_progress.get() as usize;
+                let end =
+                    std::cmp::min(start + (self.config.packet_limit - 14) as usize, data.len());
+                let is_last_packet = end == data.len();
+                self.sending_data_progress.set(end as u64);
+                Ok((data[start..end].to_vec(), is_last_packet))
+            }
+            Role::Idle => Err("Cannot slice data in Idle role."),
+        }
+    }
+
     pub fn poll(&self) -> Option<Command> {
+        let next_msg_id_for_send = || util::msg_id::increment(self.last_received_msg_id.get());
         let send = move |command: Command| -> Option<Command> {
             self.last_command_time.set(Instant::now());
             self.last_sent_msg_id.set(command.msg_id);
             self.last_sent_command.replace(command.clone());
+            // 因为 ACK 的函数并没有嵌套调用这个，所以
+            self.status.set(Status::AwaitingAck);
             Some(command)
         };
-        let ack = move |msg_id: u16, operation: String| -> Option<Command> {
+        let reset_transaction_state = || {
+            self.stage.set(Stage::Idle);
+            self.status.set(Status::Other);
+            self.role.set(Role::Idle);
+            // Clear other relevant fields like root_operation, data_param, data_return, device_op_pending etc.
+            self.data_param.borrow_mut().clear();
+            self.data_return.borrow_mut().clear();
+            self.sending_data_progress.set(0);
+            self.device_op_pending.set(false);
+            self.device_await_deadline.set(None);
+        };
+        let ack = move |msg_id: u16, operation: Operation| -> Option<Command> {
             self.last_command_time.set(Instant::now());
             Some(Command {
                 msg_id: msg_id,
                 operation: Operation::Acknowledge,
-                object: Some(operation),
+                object: Some(operation.to_name().to_string()),
                 data: None,
             })
         };
         let err = |msg: &'static str| -> Option<Command> {
+            // 在收到 ERROR 或 ACKNO ERROR 后，状态数据清零
+            // 这个逻辑在下面处理 所以这里就不写了
+            self.status.set(Status::AwaitingErrAck);
             let command = Command {
                 msg_id: 0,
                 operation: Operation::Error,
                 object: Some(String::from("ERROR")),
-                data: Some(String::from(msg)),
+                data: Some(msg.as_bytes().to_vec()),
             };
-            self.status.set(Status::AwaitingErrAck);
-            send(command)
+            self.last_command_time.set(Instant::now());
+            self.last_sent_msg_id.set(command.msg_id);
+            self.last_sent_command.replace(command.clone());
+            Some(command)
         };
         // 首先检查是否有新的指令进入 command buffer
         match self.command_processed.get() {
             // 如果没有新的指令则检查超时
             true => {
                 // Idle 则忽略当前 poll
-                if self.status == Status::Idle.into() {
+                if self.stage.get() == Stage::Idle {
                     return None;
+                }
+                if self.stage.get() == Stage::Started
+                    && self.role.get() == Role::Host
+                    && self.status.get() != Status::AwaitingAck
+                {
+                    return send(Command {
+                        msg_id: next_msg_id_for_send(),
+                        operation: Operation::Start,
+                        object: None,
+                        data: None,
+                    });
+                }
+                // Poll pending future if Device is in ParameterSent stage and an INVOK is pending
+                if self.stage.get() == Stage::ParameterSent
+                    && self.role.get() == Role::Device
+                    && self.device_op_pending.get()
+                        & (self.status.get() == Status::Other
+                            || (self.status.get() != Status::AwaitingAck
+                                && self.status.get() != Status::AwaitingErrAck))
+                {
+                    let waker = futures_task::noop_waker_ref();
+                    let mut cx = Context::from_waker(waker);
+
+                    let mut future_store = self.pending_future.borrow_mut();
+                    if let Some(pinned_future) = future_store.as_mut() {
+                        match pinned_future.as_mut().poll(&mut cx) {
+                            Poll::Ready(result) => {
+                                future_store.take(); // Remove completed future
+                                self.device_op_pending.set(false);
+                                self.device_await_deadline.set(None);
+
+                                match result {
+                                    Ok(data_opt) => {
+                                        self.data_return.replace(data_opt.unwrap_or_default());
+                                        self.stage.set(Stage::SendingResponse);
+                                        // status will be set by send() to AwaitingAck
+                                        self.sending_data_progress.set(0);
+
+                                        let rturn_object_name = if self
+                                            .data_return
+                                            .borrow()
+                                            .is_empty()
+                                        {
+                                            Operation::Empty.to_name().to_string()
+                                        } else {
+                                            // For INVOK, RTURN object is the method name
+                                            self.root_object
+                                                .borrow()
+                                                .as_ref()
+                                                .cloned()
+                                                .unwrap_or_else(|| {
+                                                    // Fallback, though root_object should be set for INVOK
+                                                    self.root_operation.get().to_name().to_string()
+                                                })
+                                        };
+                                        // RTURN itself doesn't carry data in its DATA field.
+                                        // Data is sent via subsequent SDATA commands if rturn_object_name is not EMPTY.
+                                        return send(Command {
+                                            msg_id: next_msg_id_for_send(),
+                                            operation: Operation::Return,
+                                            object: Some(rturn_object_name),
+                                            data: None,
+                                        });
+                                    }
+                                    Err(_) => {
+                                        // Future returned an error. Terminate transaction.
+                                        reset_transaction_state();
+                                        // log::error!("INVOK operation failed: {}", e_str); // Consider logging
+                                        return err("INVOK operation failed"); // Send generic PK error
+                                    }
+                                }
+                            }
+                            Poll::Pending => {
+                                if Instant::now()
+                                    > self.device_await_deadline.get().unwrap_or(Instant::now())
+                                {
+                                    return send(Command {
+                                        msg_id: next_msg_id_for_send(),
+                                        operation: Operation::Await,
+                                        object: None,
+                                        data: None,
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        return err("No pending future to poll");
+                    }
                 }
 
                 // 获取当前时间来比较超时
-                let elapsed_ms = self.last_command_time.get().elapsed().as_millis();
+                let elapsed_ms = self.last_command_time.get().elapsed();
                 match self.status.get() {
                     Status::AwaitingAck | Status::AwaitingErrAck => {
                         // 等待 ACK 时则检查 ACK 超时来确认是否重传
-                        if elapsed_ms >= self.config.ack_timeout.into() {
+                        if elapsed_ms >= self.config.ack_timeout {
                             return Some(self.last_sent_command.borrow().clone());
                         }
                     }
                     _ => {
                         // 不考虑 Idle 因为上面已经检查过了,没有等待 ACK 时则检查指令间超时
-                        if elapsed_ms >= self.config.inter_command_timeout.into() {
+                        if elapsed_ms >= self.config.inter_command_timeout {
                             return err("Operation timed out");
                         }
                     }
@@ -349,32 +266,558 @@ impl PkCommand {
             // 缓冲区内有新的指令
             false => {
                 self.command_processed.set(true);
+                self.last_received_msg_id
+                    .set(self.command_buffer.borrow().msg_id); // Store received msg_id
                 let recv = self.command_buffer.borrow();
-                if self.status.get() == Status::AwaitingErrAck {
-                    // 首先处理不被 Stage 描述的特殊情况
-                    if recv.operation == Operation::Error {
-                        self.root_operation.set(Operation::Empty);
-                        self.stage.set(Stage::Idle);
-                        self.status.set(Status::Idle);
-                        return None;
-                    } else {
+                // 首先处理 Error 这种不被 Stage 描述的特殊情况
+                if recv.operation == Operation::Error {
+                    reset_transaction_state();
+                    return ack(0, Operation::Error);
+                } else {
+                    if self.status.get() == Status::AwaitingErrAck {
+                        if recv.operation == Operation::Acknowledge
+                            && recv.object == Some(String::from("ERROR"))
+                        {
+                            self.status.set(Status::Other);
+                            self.root_operation.set(Operation::Empty);
+                            self.stage.set(Stage::Idle);
+                            self.role.set(Role::Idle);
+                            return None;
+                        } else {
+                            return err("Should be ACKNO ERROR");
+                        }
                     }
                 }
                 match self.stage.get() {
                     Stage::Idle => {
-                        // 在 Idle 状态下只能收到 START
+                        // 在 Idle 状态下只能收到 START，且自身为 Device
                         if recv.operation != Operation::Start {
                             return err("not in a chain");
                         }
+                        self.role.set(Role::Device);
                         self.stage.set(Stage::Started);
-                        self.status.set(Status::Active);
-                        return ack(recv.msg_id, recv.operation.to_name().to_string());
+                        self.status.set(Status::Other); // Awaiting root command from Host
+                        return ack(recv.msg_id, recv.operation);
                     }
+                    Stage::Started => {
+                        // 在 Started 状态下，根据当前角色不同，预期的行为应该是
+                        // - Host -> 接收到 ACK，指示当前的根操作
+                        // - Device -> 接收到根操作，进行 ACK
+                        match self.role.get() {
+                            Role::Host => {
+                                if recv.operation == Operation::Acknowledge {
+                                    self.status.set(Status::Other);
+                                    self.stage.set(Stage::RootOperationAssigned);
+                                    return send(Command {
+                                        msg_id: next_msg_id_for_send(),
+                                        operation: self.root_operation.get(),
+                                        object: self.root_object.borrow().clone(),
+                                        data: None,
+                                    });
+                                }
+                            }
+                            Role::Device => {
+                                if recv.operation.is_root() {
+                                    self.root_operation.set(recv.operation);
+                                    // Validate if object is present for ops that require it
+                                    if (recv.operation == Operation::RequireVariable
+                                        || recv.operation == Operation::SendVariable
+                                        || recv.operation == Operation::Invoke)
+                                        && recv.object.is_none()
+                                    {
+                                        reset_transaction_state();
+                                        return err(
+                                            "Operation requires an object but none was provided.",
+                                        );
+                                    }
+                                    self.root_object.replace(recv.object.clone());
+                                    self.stage.set(Stage::RootOperationAssigned);
+                                    return ack(recv.msg_id, recv.operation);
+                                } else {
+                                    return err("not a root operation");
+                                }
+                            }
+                            _ => {
+                                // 考虑代码问题，因为 Stage 已经是 Started 了，Role 不可能是 Idle
+                                panic!("Role cannot be Idle if Stage is Started")
+                            }
+                        }
+                    }
+                    Stage::RootOperationAssigned => {
+                        /* Host -> 接收到 ACK，**开始**传输数据。也就是说参数的*第一段*或 EMPTY 指令
+                          Device -> 接收到 EMPTY 或数据的第一段
+                        */
+                        match self.role.get() {
+                            Role::Host => {
+                                if recv.operation == Operation::Acknowledge {
+                                    self.status.set(Status::Other);
+                                    self.stage.set(Stage::SendingParameter);
+                                    if self.data_param.borrow().len() == 0 {
+                                        return send(Command {
+                                            msg_id: next_msg_id_for_send(),
+                                            operation: Operation::Empty,
+                                            object: None,
+                                            data: None,
+                                        });
+                                    } else {
+                                        match self.slice_data(Role::Host) {
+                                            Ok((data_chunk, _is_last)) => {
+                                                return send(Command {
+                                                    msg_id: next_msg_id_for_send(),
+                                                    operation: Operation::Data,
+                                                    object: Some(
+                                                        self.root_operation
+                                                            .get()
+                                                            .to_name()
+                                                            .to_string(),
+                                                    ),
+                                                    data: Some(data_chunk),
+                                                });
+                                            }
+                                            Err(e) => {
+                                                reset_transaction_state();
+                                                return err(e);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    return err("Should be ACKNO");
+                                }
+                            }
+                            Role::Device => {
+                                if recv.operation == Operation::Empty {
+                                    self.stage.set(Stage::SendingParameter);
+                                    return ack(recv.msg_id, recv.operation);
+                                } else if recv.operation == Operation::Data {
+                                    self.stage.set(Stage::SendingParameter);
+                                    self.data_param.borrow_mut().append(&mut Vec::from(
+                                        recv.data.as_ref().unwrap().clone(),
+                                    ));
+                                    return ack(recv.msg_id, recv.operation);
+                                } else {
+                                    return err("Should be EMPTY or DATA");
+                                }
+                            }
+                            _ => {
+                                // 同上
+                                panic!("Role cannot be Idle if Stage is RootOperationAssigned")
+                            }
+                        }
+                    }
+                    Stage::SendingParameter => {
+                        // 此阶段：
+                        // - Host: 已发送第一个参数数据包（SDATA）或 EMPTY，并收到 ACKNO。
+                        //         现在需要判断是继续发送 SDATA 还是发送 ENDTR。
+                        // - Device: 已收到第一个参数数据包（SDATA）或 EMPTY，并发送了 ACKNO。
+                        //           现在等待接收后续的 SDATA 或 ENDTR。
+                        match self.role.get() {
+                            Role::Host => {
+                                // Host 必须是收到了 ACKNO
+                                if recv.operation != Operation::Acknowledge {
+                                    return err("Host expected ACKNO in SendingParameter stage");
+                                }
+                                self.status.set(Status::Other); // ACK received, status is clear before sending next command
 
-                    _ => {}
+                                // 检查是对哪个指令的 ACKNO
+                                match self.last_sent_command.borrow().operation {
+                                    Operation::Empty => {
+                                        // 对 EMPTY 的 ACKNO，参数传输结束，发送 ENDTR
+                                        self.stage.set(Stage::ParameterSent);
+                                        return send(Command {
+                                            msg_id: next_msg_id_for_send(),
+                                            operation: Operation::EndTransaction,
+                                            object: None,
+                                            data: None,
+                                        });
+                                    }
+                                    Operation::Data => {
+                                        // 对 SDATA 的 ACKNO
+                                        let param_data_len = self.data_param.borrow().len() as u64;
+                                        if self.sending_data_progress.get() < param_data_len {
+                                            // 还有参数数据需要发送
+                                            let (data_chunk, _is_last) =
+                                                match self.slice_data(Role::Host) {
+                                                    Ok(d) => d,
+                                                    Err(e) => {
+                                                        reset_transaction_state();
+                                                        return err(e);
+                                                    }
+                                                };
+                                            self.status.set(Status::AwaitingAck);
+                                            return send(Command {
+                                                msg_id: next_msg_id_for_send(),
+                                                operation: Operation::Data,
+                                                object: Some(
+                                                    self.root_operation.get().to_name().to_string(),
+                                                ),
+                                                data: Some(data_chunk),
+                                            });
+                                        } else {
+                                            // 参数数据已全部发送完毕，发送 ENDTR
+                                            self.stage.set(Stage::ParameterSent);
+                                            return send(Command {
+                                                msg_id: next_msg_id_for_send(),
+                                                operation: Operation::EndTransaction,
+                                                object: None,
+                                                data: None,
+                                            });
+                                        }
+                                    }
+                                    _ => {
+                                        return err(
+                                            "Host received ACKNO for unexpected command in SendingParameter stage",
+                                        );
+                                    }
+                                }
+                            }
+                            Role::Device => {
+                                // Device 等待 SDATA 或 ENDTR
+                                if recv.operation == Operation::Data {
+                                    if let Some(ref data_vec) = recv.data {
+                                        self.data_param.borrow_mut().extend_from_slice(data_vec);
+                                    }
+                                    return ack(recv.msg_id, recv.operation);
+                                } else if recv.operation == Operation::EndTransaction {
+                                    self.stage.set(Stage::ParameterSent);
+                                    return ack(recv.msg_id, recv.operation);
+                                } else {
+                                    return err(
+                                        "Device expected DATA or ENDTR in SendingParameter stage",
+                                    );
+                                }
+                            }
+                            Role::Idle => {
+                                panic!("Role cannot be Idle if Stage is SendingParameter")
+                            }
+                        }
+                    }
+                    Stage::ParameterSent => {
+                        /* Host -> 收到对 ENDTR 的 ACK，发送 QUERY。等待回传数据或 AWAKE 保活。
+                        Device -> 收到 QUERY，执行逻辑，处理保活和/或回传数据。 */
+                        match self.role.get() {
+                            Role::Host => match recv.operation {
+                                Operation::Acknowledge => {
+                                    self.status.set(Status::Other); // ACK received
+                                    if recv.object == Some(String::from("ENDTR")) {
+                                        return send(Command {
+                                            msg_id: util::msg_id::increment(recv.msg_id),
+                                            operation: Operation::Query,
+                                            object: None,
+                                            data: None,
+                                        });
+                                    } else if recv.object == Some(String::from("QUERY")) {
+                                        return None;
+                                    } else {
+                                        return err(
+                                            "Host: Unexpected ACK object in ParameterSent stage",
+                                        );
+                                    }
+                                }
+                                Operation::Await => {
+                                    return ack(recv.msg_id, recv.operation);
+                                }
+                                Operation::Return => {
+                                    if recv.object == Some(String::from("EMPTY"))
+                                        || recv.object
+                                            == Some(self.root_operation.get().to_name().to_string())
+                                    {
+                                        self.stage.set(Stage::SendingResponse);
+                                        return ack(recv.msg_id, recv.operation);
+                                    }
+                                }
+                                _ => {
+                                    return err("Should be ACKNO, AWAIT or RETURN");
+                                }
+                            },
+                            Role::Device => {
+                                if recv.operation == Operation::Query {
+                                    // 开始执行逻辑，然后 ACK
+                                    match self.root_operation.get() {
+                                        Operation::GetVersion => {
+                                            self.data_return.replace(
+                                                self.config.pk_version.as_bytes().to_vec(),
+                                            );
+                                            self.stage.set(Stage::SendingResponse);
+                                        }
+                                        Operation::RequireVariable => {
+                                            let key = match self
+                                                .root_object
+                                                .borrow()
+                                                .as_ref()
+                                                .cloned()
+                                            {
+                                                Some(k) => k,
+                                                None => {
+                                                    // This check should ideally be when root_op was received
+                                                    reset_transaction_state();
+                                                    return err(
+                                                        "Internal: Missing object name for REQUV.",
+                                                    );
+                                                }
+                                            };
+                                            self.data_return.replace(
+                                                self.variable_accessor.get(key).unwrap_or(vec![]),
+                                            );
+                                            self.stage.set(Stage::SendingResponse);
+                                        }
+                                        Operation::SendVariable => {
+                                            let key = match self
+                                                .root_object
+                                                .borrow()
+                                                .as_ref()
+                                                .cloned()
+                                            {
+                                                Some(k) => k,
+                                                None => {
+                                                    // This check should ideally be when root_op was received
+                                                    reset_transaction_state();
+                                                    return err(
+                                                        "Internal: Missing object name for SENDV.",
+                                                    );
+                                                }
+                                            };
+                                            self.data_return.replace(
+                                                if let Err(e) = self
+                                                    .variable_accessor
+                                                    .set(key, self.data_param.borrow().clone())
+                                                {
+                                                    e.as_bytes().to_vec()
+                                                } else {
+                                                    vec![]
+                                                },
+                                            );
+                                            self.stage.set(Stage::SendingResponse); // Note: SENDV error reporting via data_return
+                                        }
+                                        Operation::Invoke => {
+                                            self.device_op_pending.set(true);
+                                            self.device_await_deadline.set(Some(
+                                                Instant::now() + self.config.await_interval,
+                                            ));
+                                            // The object for INVOK is self.root_object, not from QUERY (recv.object)
+                                            let method_name = match self
+                                                .root_object
+                                                .borrow()
+                                                .as_ref()
+                                                .cloned()
+                                            {
+                                                Some(name) => name,
+                                                None => {
+                                                    reset_transaction_state();
+                                                    return err(
+                                                        "Internal: Missing method name for INVOK",
+                                                    );
+                                                }
+                                            };
+                                            match self
+                                                .method_accessor
+                                                .call(method_name, self.data_param.borrow().clone())
+                                            {
+                                                Ok(future) => {
+                                                    self.pending_future.replace(Some(future));
+                                                }
+                                                Err(_) => {
+                                                    reset_transaction_state();
+                                                    // log::error!("Failed to create INVOK future: {}", e_str);
+                                                    return err(
+                                                        "Failed to initiate INVOK operation",
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            reset_transaction_state();
+                                            return err("Not a root operation");
+                                        }
+                                    }
+                                    return ack(recv.msg_id, recv.operation);
+                                }
+                            }
+                            Role::Idle => {
+                                panic!("Role cannot be Idle if Stage is ParameterSent")
+                            }
+                        }
+                    }
+                    Stage::SendingResponse => {
+                        /* Host -> 收到对 RETURN 的 ACK，开始接收数据。
+                        Device -> 收到对 QUERY 的 ACK，发送 RETURN。 */
+                        match self.role.get() {
+                            Role::Host => {
+                                // Host 等待 SDATA 或 ENDTR
+                                if recv.operation == Operation::Data {
+                                    // Host receives SDATA from Device
+                                    if let Some(ref data_vec) = recv.data {
+                                        self.data_return.borrow_mut().extend_from_slice(data_vec);
+                                    }
+                                    return ack(recv.msg_id, recv.operation);
+                                } else if recv.operation == Operation::EndTransaction {
+                                    let endtr_ack = ack(recv.msg_id, recv.operation);
+                                    // 收到 ENDTR，事务结束
+                                    reset_transaction_state();
+                                    return endtr_ack;
+                                } else {
+                                    return err(
+                                        "Host expected DATA or ENDTR in SendingResponse stage",
+                                    );
+                                }
+                            }
+                            Role::Device => {
+                                // Device 必须是收到了 ACKNO
+                                if recv.operation != Operation::Acknowledge {
+                                    return err("Device expected ACKNO in SendingResponse stage");
+                                }
+                                self.status.set(Status::Other); // ACK received, status is clear before sending next command
+
+                                // 检查是对哪个指令的 ACKNO
+                                match self.last_sent_command.borrow().operation {
+                                    Operation::Return => {
+                                        // 对 RETURN 的 ACKNO
+                                        let return_data_len =
+                                            self.data_return.borrow().len() as u64;
+                                        if return_data_len == 0 {
+                                            // 没有返回值，直接发送 ENDTR
+                                            self.stage.set(Stage::Idle); // Transaction ends
+                                            return send(Command {
+                                                msg_id: next_msg_id_for_send(),
+                                                operation: Operation::EndTransaction,
+                                                object: None,
+                                                data: None,
+                                            });
+                                        } else {
+                                            // 有返回值
+                                            let (data_chunk, _) =
+                                                match self.slice_data(Role::Device) {
+                                                    Ok(d) => d,
+                                                    Err(e) => {
+                                                        reset_transaction_state();
+                                                        return err(e);
+                                                    }
+                                                };
+
+                                            return send(Command {
+                                                msg_id: next_msg_id_for_send(),
+                                                operation: Operation::Data,
+                                                object: Some(
+                                                    self.root_operation.get().to_name().to_string(),
+                                                ),
+                                                data: Some(data_chunk),
+                                            });
+                                        }
+                                    }
+                                    Operation::Data => {
+                                        if self.sending_data_progress.get()
+                                            < self.data_return.borrow().len() as u64
+                                        {
+                                            let (data_chunk, _) =
+                                                match self.slice_data(Role::Device) {
+                                                    Ok(d) => d,
+                                                    Err(e) => {
+                                                        reset_transaction_state();
+                                                        return err(e);
+                                                    }
+                                                };
+                                            return send(Command {
+                                                msg_id: next_msg_id_for_send(),
+                                                operation: Operation::Data,
+                                                object: Some(
+                                                    self.root_operation.get().to_name().to_string(),
+                                                ),
+                                                data: Some(data_chunk),
+                                            });
+                                        } else {
+                                            return send(Command {
+                                                msg_id: next_msg_id_for_send(),
+                                                operation: Operation::EndTransaction,
+                                                object: None,
+                                                data: None,
+                                            });
+                                        }
+                                    }
+                                    Operation::EndTransaction => {
+                                        self.role.set(Role::Idle);
+                                        self.stage.set(Stage::Idle);
+                                        reset_transaction_state(); // Resets role, stage, status to Other
+                                        return None;
+                                    }
+                                    Operation::Await => {
+                                        // Device received ACKNO AWAIT
+                                        // self.status is Other. Device continues pending op.
+                                        return None;
+                                    }
+                                    _ => {
+                                        return err(
+                                            "Device received ACKNO for unexpected command in SendingResponse stage",
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                panic!("Role cannot be Idle if Stage is SendingResponse")
+                            }
+                        }
+                    }
                 }
             }
         }
         None
+    }
+
+    pub fn perform(
+        &self,
+        operation: Operation,
+        object: Option<String>,
+        data: Option<Vec<u8>>,
+    ) -> Result<(), &'static str> {
+        if operation.is_root()
+            && self.stage.get() == Stage::Idle
+            && self.status.get() == Status::Other
+            && self.role.get() == Role::Idle
+        {
+            self.root_operation.set(operation);
+            self.root_object.replace(object);
+            self.data_param.replace(data.unwrap_or(vec![]));
+            self.role.set(Role::Host);
+            self.stage.set(Stage::Started);
+            self.status.set(Status::Other);
+            Ok(())
+        } else if !operation.is_root() {
+            Err("Cannot initiate a non-root operation")
+        } else {
+            Err("Cannot initiate an operation when the transaction is in progress")
+        }
+    }
+
+    pub fn new(config: PkCommandConfig, variable_accessor: VA, method_accessor: MA) -> Self {
+        PkCommand {
+            stage: Cell::new(Stage::Idle),
+            status: Cell::new(Status::Other),
+            role: Cell::new(Role::Idle),
+            last_sent_command: RefCell::new(Command {
+                msg_id: 0,
+                operation: Operation::Empty,
+                object: None,
+                data: None,
+            }),
+            last_sent_msg_id: Cell::new(0),
+            last_received_msg_id: Cell::new(0),
+            data_param: RefCell::new(vec![]),
+            data_return: RefCell::new(vec![]),
+            sending_data_progress: Cell::new(0),
+            root_operation: Cell::new(Operation::Empty),
+            root_object: RefCell::new(None),
+            command_buffer: RefCell::new(Command {
+                msg_id: 0,
+                operation: Operation::Empty,
+                object: None,
+                data: None,
+            }),
+            command_processed: Cell::new(true),
+            last_command_time: Cell::new(Instant::now()),
+            device_op_pending: Cell::new(false),
+            device_await_deadline: Cell::new(None),
+            config,
+            variable_accessor,
+            method_accessor,
+            pending_future: RefCell::new(None),
+        }
     }
 }
