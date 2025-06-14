@@ -1,7 +1,9 @@
+const PK_VERSION: &'static str = "0.5";
+
 use std::cell::{Cell, RefCell};
-use std::future::Future; // Import Future trait
+use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll}; // Import Context and Poll
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 mod types;
@@ -10,12 +12,43 @@ use types::{Command, Operation, Role, Stage, Status};
 
 pub use util::{PkMHashmapWrapper, PkVHashmapWrapper};
 
+/// Trait defining how to access (get/set) variables by their string key.
+///
+/// This allows the `PkCommand` state machine to be generic over the actual variable storage.
 pub trait PkVariableAccessor {
+    /// Retrieves the value of a variable.
+    ///
+    /// # Arguments
+    /// * `key`: The name of the variable to retrieve.
+    ///
+    /// # Returns
+    /// `Some(Vec<u8>)` containing the variable's data if found, or `None` otherwise.
     fn get(&self, key: String) -> Option<Vec<u8>>;
+
+    /// Sets the value of a variable.
+    ///
+    /// # Arguments
+    /// * `key`: The name of the variable to set.
+    /// * `value`: The new data for the variable.
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, or an `Err(String)` describing the error.
     fn set(&self, key: String, value: Vec<u8>) -> Result<(), String>;
 }
 
+/// Trait defining how to invoke methods by their string key.
+///
+/// This allows the `PkCommand` state machine to be generic over the actual method implementation.
 pub trait PkMethodAccessor {
+    /// Calls a method with the given parameters.
+    ///
+    /// # Arguments
+    /// * `key`: The name of the method to call.
+    /// * `param`: The parameters for the method, as a byte vector.
+    ///
+    /// # Returns
+    /// A `Result` containing a pinned, boxed Future that will resolve to the method's output
+    /// (`Result<Option<Vec<u8>>, String>`), or an `Err(String)` if the method call cannot be initiated.
     fn call(
         &self,
         key: String,
@@ -23,14 +56,24 @@ pub trait PkMethodAccessor {
     ) -> Result<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>, String>;
 }
 
+/// Configuration for the `PkCommand` state machine.
 pub struct PkCommandConfig {
+    /// Timeout duration for waiting for an `ACKNO` command.
     ack_timeout: Duration,
+    /// Timeout duration for waiting for the next command in a sequence when not waiting for an `ACKNO`.
     inter_command_timeout: Duration,
+    /// Interval at which the Device should send `AWAIT` commands during long-running operations.
     await_interval: Duration,
-    packet_limit: u64, // 一个包的最大长度
+    /// The maximum length of a single command packet, including headers and data.
+    packet_limit: u64,
+    /// The version string of the PK protocol interpreter.
     pk_version: &'static str,
 }
 
+/// The main state machine for handling the PK Command protocol.
+///
+/// It manages transaction states, command parsing, command generation,
+/// acknowledgments, timeouts, and data slicing.
 pub struct PkCommand<VA, MA>
 where
     VA: PkVariableAccessor,
@@ -41,18 +84,17 @@ where
     role: Cell<Role>,
     last_sent_command: RefCell<Command>,
     last_sent_msg_id: Cell<u16>,
-    last_received_msg_id: Cell<u16>, // ID of the last valid command received from the other side
+    last_received_msg_id: Cell<u16>,
     data_param: RefCell<Vec<u8>>,
     data_return: RefCell<Vec<u8>>,
     sending_data_progress: Cell<u64>,
     root_operation: Cell<Operation>,
     root_object: RefCell<Option<String>>,
-    command_buffer: RefCell<Command>, // 收到的指令
-    command_processed: Cell<bool>,    // “command_buffer”中的命令是否已在上次 poll 处理完毕
-    last_command_time: Cell<Instant>, // 上次收到/发出命令的时间
-    // For Device role during INVOK/REQUV response phase:
-    device_op_pending: Cell<bool>, // True if Device is executing an INVOK/REQUV and app hasn't provided result
-    device_await_deadline: Cell<Option<Instant>>, // When the next AWAIT should be sent if op is still pending
+    command_buffer: RefCell<Command>,
+    command_processed: Cell<bool>,
+    last_command_time: Cell<Instant>,
+    device_op_pending: Cell<bool>,
+    device_await_deadline: Cell<Option<Instant>>,
     config: PkCommandConfig,
     variable_accessor: VA,
     method_accessor: MA,
@@ -60,6 +102,17 @@ where
 }
 
 impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
+    /// Ingests a raw command received from the other party.
+    ///
+    /// The command bytes are parsed, and if successful, the parsed `Command`
+    /// is stored in an internal buffer to be processed by the next call to `poll()`.
+    ///
+    /// # Arguments
+    /// * `command_bytes`: A `Vec<u8>` containing the raw bytes of the received command.
+    ///
+    /// # Returns
+    /// `Ok(())` if the command was successfully parsed and buffered.
+    /// `Err(&'static str)` if parsing failed.
     pub fn incoming_command(&self, command_bytes: Vec<u8>) -> Result<(), &'static str> {
         match Command::parse(&command_bytes) {
             // Pass as slice
@@ -73,6 +126,19 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
         }
     }
 
+    /// Slices a chunk of data from either `data_param` (for Host sending)
+    /// or `data_return` (for Device sending).
+    ///
+    /// The size of the chunk is determined by `config.packet_limit` minus protocol overhead.
+    /// Updates `sending_data_progress`.
+    ///
+    /// # Arguments
+    /// * `role`: The current role of this `PkCommand` instance, determining which buffer to use.
+    ///
+    /// # Returns
+    /// `Ok((Vec<u8>, bool))` where the `Vec<u8>` is the data chunk and the `bool` is `true`
+    /// if this is the last chunk of data.
+    /// `Err(&'static str)` if there's no data to send or if the role is `Idle`.
     fn slice_data(&self, role: Role) -> Result<(Vec<u8>, bool), &'static str> {
         // 如果 Role 是 Device 则默认在发送返回值，反之亦然
         match role {
@@ -104,6 +170,17 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
         }
     }
 
+    /// Polls the state machine for actions.
+    ///
+    /// This method should be called periodically. It processes incoming commands
+    /// from the internal buffer (filled by `incoming_command`), handles timeouts,
+    /// manages retransmissions, and progresses through the transaction stages.
+    ///
+    /// If the state machine determines that a command needs to be sent to the other party,
+    /// this method will return `Some(Command)`.
+    ///
+    /// # Returns
+    /// `Some(Command)` if a command needs to be sent, or `None` otherwise.
     pub fn poll(&self) -> Option<Command> {
         let next_msg_id_for_send = || util::msg_id::increment(self.last_received_msg_id.get());
         let send = move |command: Command| -> Option<Command> {
@@ -735,7 +812,8 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                     Operation::EndTransaction => {
                                         self.role.set(Role::Idle);
                                         self.stage.set(Stage::Idle);
-                                        reset_transaction_state(); // Resets role, stage, status to Other
+                                        // reset_transaction_state();
+                                        // 结束后不清理数据，考虑到外部可能手动获取，这里就不操心了
                                         return None;
                                     }
                                     Operation::Await => {
@@ -761,6 +839,20 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
         None
     }
 
+    /// Initiates a new root operation from the Host side.
+    ///
+    /// This method should only be called when the `PkCommand` instance is in an `Idle` state.
+    /// It sets up the necessary internal state to begin a new transaction.
+    /// The actual `START` command and subsequent root operation command will be generated
+    /// by subsequent calls to `poll()`.
+    ///
+    /// # Arguments
+    /// * `operation`: The root `Operation` to perform (e.g., `SENDV`, `REQUV`, `INVOK`, `PKVER`).
+    /// * `object`: An optional `String` representing the object of the operation (e.g., variable name, method name).
+    /// * `data`: Optional `Vec<u8>` containing parameter data for the operation (e.g., for `SENDV` or `INVOK`).
+    ///
+    /// # Returns
+    /// `Ok(())` if the operation can be initiated, or `Err(&'static str)` if not (e.g., not idle, or not a root operation).
     pub fn perform(
         &self,
         operation: Operation,
@@ -786,6 +878,79 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
         }
     }
 
+    fn reset_transaction_state(&self) -> () {
+        self.stage.set(Stage::Idle);
+        self.status.set(Status::Other);
+        self.role.set(Role::Idle);
+        // Clear other relevant fields like root_operation, data_param, data_return, device_op_pending etc.
+        self.data_param.borrow_mut().clear();
+        self.data_return.borrow_mut().clear();
+        self.sending_data_progress.set(0);
+        self.device_op_pending.set(false);
+        self.device_await_deadline.set(None);
+    }
+
+    /// Checks if the transaction is complete (i.e., the state machine is in the `Idle` stage).
+    ///
+    /// # Returns
+    /// `true` if the transaction is complete, `false` otherwise.
+    pub fn is_complete(&self) -> bool {
+        self.stage.get() == Stage::Idle
+    }
+
+    /// Retrieves the return data from the completed transaction.
+    ///
+    /// This method should only be called when `is_complete()` returns `true` and the
+    /// instance is acting as the Host.
+    ///
+    /// # Returns
+    /// `Some(Vec<u8>)` containing the return data if available, or `None` if there was no return data.
+    pub fn get_return_data(&self) -> Option<Vec<u8>> {
+        if self.stage.get() == Stage::Idle && self.role.get() == Role::Host {
+            let data = self.data_return.borrow().clone();
+            self.reset_transaction_state();
+            if data.is_empty() {
+                None
+            } else {
+                Some(data.clone())
+            }
+        } else {
+            None // Not in a state to provide return data
+        }
+    }
+
+    /// Waits for the transaction to complete and then executes a callback with the return data.
+    ///
+    /// This is a blocking or polling-based wait depending on how the surrounding code
+    /// calls `poll()`. The callback is only executed once the state machine enters the `Idle` stage.
+    ///
+    /// # Arguments
+    /// * `callback`: A closure that takes an `Option<Vec<u8>>` (the return data) and is executed upon completion.
+    ///
+    /// # Note
+    /// This method assumes `poll()` is being called externally to drive the state machine.
+    /// It does not block the current thread waiting for completion, but rather checks the state
+    /// and executes the callback if complete. You must ensure `poll()` is called frequently
+    /// for the transaction to progress.
+    pub fn wait_for_complete_and<F>(&self, callback: F) -> ()
+    where
+        F: FnOnce(Option<Vec<u8>>) -> (),
+    {
+        // 这个函数也是轮询的，用来给 Host 方返回值（因为在上面的 perform 中并没有告诉 PK 该怎么处理返回值）
+        if self.stage.get() == Stage::Idle {
+            let data = self.data_return.borrow().clone();
+            self.reset_transaction_state();
+            callback(if data.len() == 0 { None } else { Some(data) })
+        }
+    }
+
+    /// Creates a new `PkCommand` state machine instance.
+    ///
+    /// # Arguments
+    /// * `config`: The `PkCommandConfig` to use.
+    /// * `variable_accessor`: An implementation of `PkVariableAccessor` for variable operations.
+    /// * `method_accessor`: An implementation of `PkMethodAccessor` for method invocation.
+    ///
     pub fn new(config: PkCommandConfig, variable_accessor: VA, method_accessor: MA) -> Self {
         PkCommand {
             stage: Cell::new(Stage::Idle),
@@ -818,6 +983,45 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
             variable_accessor,
             method_accessor,
             pending_future: RefCell::new(None),
+        }
+    }
+}
+impl PkCommandConfig {
+    /// Creates a `PkCommandConfig` with default timeout values.
+    ///
+    /// # Arguments
+    /// * `packet_limit`: The maximum packet size allowed by the transport layer.
+    ///
+    pub fn default(packet_limit: u64) -> Self {
+        PkCommandConfig {
+            ack_timeout: Duration::from_millis(100),
+            inter_command_timeout: Duration::from_millis(500),
+            await_interval: Duration::from_millis(300),
+            packet_limit,
+            pk_version: PK_VERSION,
+        }
+    }
+
+    /// Creates a new `PkCommandConfig` with specified values.
+    ///
+    /// # Arguments
+    /// * `ack_timeout`: ACK timeout in milliseconds.
+    /// * `inter_command_timeout`: Inter-command timeout in milliseconds.
+    /// * `await_interval`: AWAIT interval in milliseconds.
+    /// * `packet_limit`: The maximum packet size allowed by the transport layer.
+    ///
+    pub fn new(
+        ack_timeout: u64,
+        inter_command_timeout: u64,
+        await_interval: u64,
+        packet_limit: u64,
+    ) -> Self {
+        PkCommandConfig {
+            ack_timeout: Duration::from_millis(ack_timeout),
+            inter_command_timeout: Duration::from_millis(inter_command_timeout),
+            await_interval: Duration::from_millis(await_interval),
+            packet_limit, // Default packet limit if not specified
+            pk_version: PK_VERSION,
         }
     }
 }

@@ -1,5 +1,6 @@
 use crate::util::msg_id;
 
+/// Defines the set of operations supported by the PK Command protocol.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Operation {
     SendVariable,    // SENDV
@@ -18,6 +19,7 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Returns the 5-character string representation of the operation.
     pub fn to_name(&self) -> &'static str {
         match self {
             Operation::SendVariable => "SENDV",
@@ -36,6 +38,7 @@ impl Operation {
         }
     }
 
+    /// Creates an `Operation` from its 5-character string representation.
     pub fn from_name(name: &str) -> Option<Operation> {
         match name {
             "SENDV" => Some(Operation::SendVariable),
@@ -55,6 +58,7 @@ impl Operation {
         }
     }
 
+    /// Checks if the operation is a "root operation" that can initiate a transaction chain.
     pub fn is_root(&self) -> bool {
         match self {
             Operation::SendVariable
@@ -66,13 +70,18 @@ impl Operation {
     }
 }
 
+/// Defines the role of a participant in a PK Command transaction.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Role {
-    Host,   // 调用方（不一定是主机）
+    /// The initiator of the transaction.
+    Host, // 调用方（不一定是主机）
+    /// The receiver and executor of the transaction.
     Device, // 接收方（不一定是设备）
-    Idle,   // （空闲期没有角色）
+    /// Indicates that no transaction is active, and thus no specific role is assigned.
+    Idle, // （空闲期没有角色）
 }
 
+/// Represents a parsed or to-be-sent PK Command.
 #[derive(Clone)]
 pub struct Command {
     pub msg_id: u16,
@@ -82,6 +91,15 @@ pub struct Command {
 }
 
 impl Command {
+    /// Parses a byte slice into a `Command` struct.
+    ///
+    /// The byte slice is expected to conform to the PK Command protocol format.
+    ///
+    /// # Arguments
+    /// * `msg_bytes`: A byte slice representing the raw command.
+    ///
+    /// # Returns
+    /// A `Result` containing the parsed `Command` or a static string slice describing the error.
     pub fn parse(msg_bytes: &[u8]) -> Result<Command, &'static str> {
         // 1. 检查最小长度
         if msg_bytes.len() < 7 {
@@ -188,6 +206,10 @@ impl Command {
         })
     }
 
+    /// Serializes the `Command` struct into a `Vec<u8>` according to the PK Command protocol format.
+    ///
+    /// # Panics
+    /// Panics if `self.msg_id` is invalid and cannot be converted by `msg_id::from_u16` (should not happen with valid IDs).
     pub fn to_bytes(&self) -> Vec<u8> {
         let id = match self.operation {
             Operation::Error => String::from("  "),
@@ -276,14 +298,19 @@ impl std::fmt::Display for Command {
     }
 }
 
+/// Indicates the specific status of the command sender/receiver regarding acknowledgments.
 // 指示当前收发指令方的特定状态
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Status {
-    Other,          // 没有等待 ACK
-    AwaitingAck,    // 等待 ACK
+    /// Not currently awaiting an acknowledgment.
+    Other, // 没有等待 ACK
+    /// Awaiting a standard acknowledgment (`ACKNO`).
+    AwaitingAck, // 等待 ACK
+    /// Awaiting an acknowledgment for a sent `ERROR` command.
     AwaitingErrAck, // 等待 ACK（发送 ERROR 后）
 }
 
+/// Indicates the current stage of a transaction chain.
 // 指示当前“链”的状态（传输阶段）
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Stage {
