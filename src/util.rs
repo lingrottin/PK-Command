@@ -117,12 +117,12 @@ pub mod msg_id {
 }
 
 /// A wrapper for `std::collections::HashMap` that implements the `PkVariableAccessor` trait.
-pub struct PkVHashmapWrapper {
+pub struct PkHashmapVariable {
     // 这是一个实现了 PkVariableAccessor trait 的 Hashmap 包装器，
     // 基于 std 的 Hashmap 和 RefCell 类型，实现内部可变性和变量更改时的监听
     hashmap: std::collections::HashMap<String, (RefCell<Vec<u8>>, Box<dyn Fn(Vec<u8>) -> ()>)>,
 }
-impl crate::PkVariableAccessor for PkVHashmapWrapper {
+impl crate::PkVariableAccessor for PkHashmapVariable {
     fn get(&self, key: String) -> Option<Vec<u8>> {
         self.hashmap.get(&key).map(|v| v.0.borrow().clone())
     }
@@ -138,8 +138,8 @@ impl crate::PkVariableAccessor for PkVHashmapWrapper {
         }
     }
 }
-impl PkVHashmapWrapper {
-    /// Creates a new `PkVHashmapWrapper` instance.
+impl PkHashmapVariable {
+    /// Creates a new `PkHashmapVariable` instance.
     ///
     /// # Arguments
     /// * `init_vec`: A vector of tuples, where each tuple contains:
@@ -155,18 +155,18 @@ impl PkVHashmapWrapper {
             let (key, value, listener) = i;
             hashmap.insert(key, (RefCell::new(value.unwrap_or_default()), listener));
         }
-        PkVHashmapWrapper { hashmap }
+        PkHashmapVariable { hashmap }
     }
 }
 
 /// A wrapper for `std::collections::HashMap` that implements the `PkMethodAccessor` trait.
-pub struct PkMHashmapWrapper {
+pub struct PkHashmapMethod {
     // 这是一个实现了 PkMethodAccessor trait 的 Hashmap 包装器，
     hashmap:
         std::collections::HashMap<String, Box<dyn Fn(Option<Vec<u8>>) -> Pin<Box<dyn Pollable>>>>,
 }
 
-impl crate::PkMethodAccessor for PkMHashmapWrapper {
+impl crate::PkMethodAccessor for PkHashmapMethod {
     fn call(&self, key: String, param: Vec<u8>) -> Result<Pin<Box<dyn Pollable>>, String> {
         if self.hashmap.contains_key(&key) {
             let f = self.hashmap.get(&key).unwrap();
@@ -177,7 +177,7 @@ impl crate::PkMethodAccessor for PkMHashmapWrapper {
     }
 }
 
-impl PkMHashmapWrapper {
+impl PkHashmapMethod {
     /// Creates a new `PkMHashmapWrapper` instance.
     ///
     /// # Arguments
@@ -196,7 +196,7 @@ impl PkMHashmapWrapper {
             let (key, method) = i;
             hashmap.insert(key, method);
         }
-        PkMHashmapWrapper { hashmap }
+        PkHashmapMethod { hashmap }
     }
 }
 
@@ -204,11 +204,11 @@ impl PkMHashmapWrapper {
 ///
 /// This is like `Promise` in JavaScript.
 #[derive(Clone)]
-pub struct PkPollable {
+pub struct PkPromise {
     return_value: Arc<RwLock<Option<Vec<u8>>>>,
 }
-impl PkPollable {
-    /// Creates a new `PkPollable` and executes a function in a new thread.
+impl PkPromise {
+    /// Creates a new `PkPromise` and executes a function in a new thread.
     ///
     /// The provided function `function` will be executed in a separate thread.
     /// It receives a `resolve` closure as an argument. The user's function
@@ -221,7 +221,7 @@ impl PkPollable {
     ///   result data when the task finishes successfully.
     ///
     /// # Returns
-    /// A new `PkPollable` instance that can be polled to check the status
+    /// A new `PkPromise` instance that can be polled to check the status
     /// of the asynchronous operation.
     pub fn execute<T>(function: T) -> Pin<Box<Self>>
     where
@@ -237,12 +237,12 @@ impl PkPollable {
                 });
             function(Box::new(resolve));
         });
-        Box::pin(PkPollable {
+        Box::pin(PkPromise {
             return_value: return_value_arc,
         })
     }
 }
-impl Pollable for PkPollable {
+impl Pollable for PkPromise {
     fn poll(&self) -> std::task::Poll<Result<Option<Vec<u8>>, String>> {
         let read_guard = self.return_value.read().unwrap();
         match read_guard.as_ref() {

@@ -5,7 +5,7 @@ mod pk_command_integration_tests {
     use std::time::Duration;
 
     use pk_command::{PkCommand, PkCommandConfig, types::Operation as PkOperation};
-    use pk_command::{PkMHashmapWrapper, PkPollable, PkVHashmapWrapper};
+    use pk_command::{PkHashmapMethod, PkHashmapVariable, PkPromise};
 
     const VARIA: &[u8] = b"variable value";
     const LONGV: &[u8] =b"(this is a very long string)Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.";
@@ -25,8 +25,8 @@ mod pk_command_integration_tests {
                 println!("[Host] Thread started");
 
                 // In our test case, Host literally has no method or variable
-                let var_accessor = PkVHashmapWrapper::new(vec![]);
-                let method_accessor = PkMHashmapWrapper::new(vec![]);
+                let var_accessor = PkHashmapVariable::new(vec![]);
+                let method_accessor = PkHashmapMethod::new(vec![]);
                 let host_pkc =
                     PkCommand::new(PkCommandConfig::default(64), var_accessor, method_accessor);
 
@@ -94,7 +94,7 @@ mod pk_command_integration_tests {
                         println!("[Variable Accessor] {} is changed", name);
                     };
                 };
-                let var_accessor = PkVHashmapWrapper::new(vec![
+                let var_accessor = PkHashmapVariable::new(vec![
                     (
                         String::from("VARIA"),
                         Some(VARIA.to_vec()),
@@ -106,25 +106,23 @@ mod pk_command_integration_tests {
                         Box::new(variable_listener("LONGV")),
                     ),
                 ]);
-                let method_accessor = PkMHashmapWrapper::new(vec![
+                let method_accessor = PkHashmapMethod::new(vec![
                     (
                         String::from("ECHOO"),
                         Box::new(|param| {
-                            PkPollable::execute(|resolve| {
+                            PkPromise::execute(|resolve| {
                                 resolve(param.unwrap_or(b"empty".to_vec()))
                             })
                         }),
                     ),
                     (
                         String::from("DEVID"),
-                        Box::new(|_| {
-                            PkPollable::execute(|resolve| resolve(b"device_123".to_vec()))
-                        }),
+                        Box::new(|_| PkPromise::execute(|resolve| resolve(b"device_123".to_vec()))),
                     ),
                     (
                         String::from("LONGO"),
                         Box::new(|_| {
-                            PkPollable::execute(|resolve| {
+                            PkPromise::execute(|resolve| {
                                 thread::sleep(Duration::from_secs(2));
                                 resolve(b"long_op_done".to_vec())
                             })

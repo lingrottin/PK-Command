@@ -9,7 +9,7 @@ pub mod types;
 mod util;
 use types::{Command, Operation, Role, Stage, Status};
 
-pub use util::{PkMHashmapWrapper, PkPollable, PkVHashmapWrapper};
+pub use util::{PkHashmapMethod, PkHashmapVariable, PkPromise};
 
 /// Trait defining how to access (get/set) variables by their string key.
 ///
