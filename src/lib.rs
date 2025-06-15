@@ -1,16 +1,15 @@
-const PK_VERSION: &'static str = "0.5";
+const PK_VERSION: &'static str = "1.0.0";
 
 use std::cell::{Cell, RefCell};
-use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
-mod types;
+pub mod types;
 mod util;
 use types::{Command, Operation, Role, Stage, Status};
 
-pub use util::{PkMHashmapWrapper, PkVHashmapWrapper};
+pub use util::{PkMHashmapWrapper, PkPollable, PkVHashmapWrapper};
 
 /// Trait defining how to access (get/set) variables by their string key.
 ///
@@ -36,6 +35,15 @@ pub trait PkVariableAccessor {
     fn set(&self, key: String, value: Vec<u8>) -> Result<(), String>;
 }
 
+/// Trait defining the `poll` method for a pk method which is invoked
+///
+/// This is designed for time-consuming tasks, like `Future`, but not for
+/// asynchronous programming. Ideal impletation may be multithreaded or something else that
+/// ensures the main thread not to be blocked.
+pub trait Pollable {
+    fn poll(&self) -> std::task::Poll<Result<Option<Vec<u8>>, String>>;
+}
+
 /// Trait defining how to invoke methods by their string key.
 ///
 /// This allows the `PkCommand` state machine to be generic over the actual method implementation.
@@ -47,16 +55,13 @@ pub trait PkMethodAccessor {
     /// * `param`: The parameters for the method, as a byte vector.
     ///
     /// # Returns
-    /// A `Result` containing a pinned, boxed Future that will resolve to the method's output
+    /// A `Result` containing a pinned, boxed `Pollable` that will resolve to the method's output
     /// (`Result<Option<Vec<u8>>, String>`), or an `Err(String)` if the method call cannot be initiated.
-    fn call(
-        &self,
-        key: String,
-        param: Vec<u8>,
-    ) -> Result<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>, String>;
+    fn call(&self, key: String, param: Vec<u8>) -> Result<Pin<Box<dyn Pollable>>, String>;
 }
 
 /// Configuration for the `PkCommand` state machine.
+#[derive(Clone)]
 pub struct PkCommandConfig {
     /// Timeout duration for waiting for an `ACKNO` command.
     ack_timeout: Duration,
@@ -98,7 +103,8 @@ where
     config: PkCommandConfig,
     variable_accessor: VA,
     method_accessor: MA,
-    pending_future: RefCell<Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>>>,
+    pending_pollable: RefCell<Option<Pin<Box<dyn Pollable>>>>,
+    device_should_return: Cell<bool>, // 设备是否“收到了 QUERY 但还没有返回值”
 }
 
 impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
@@ -196,11 +202,13 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
             self.status.set(Status::Other);
             self.role.set(Role::Idle);
             // Clear other relevant fields like root_operation, data_param, data_return, device_op_pending etc.
-            self.data_param.borrow_mut().clear();
-            self.data_return.borrow_mut().clear();
+            self.data_param.replace(vec![]);
+            self.data_return.replace(vec![]);
             self.sending_data_progress.set(0);
             self.device_op_pending.set(false);
             self.device_await_deadline.set(None);
+            self.pending_pollable.replace(None); //确保清理
+            self.device_should_return.set(false);
         };
         let ack = move |msg_id: u16, operation: Operation| -> Option<Command> {
             self.last_command_time.set(Instant::now());
@@ -228,7 +236,6 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
         };
         // 首先检查是否有新的指令进入 command buffer
         match self.command_processed.get() {
-            // 如果没有新的指令则检查超时
             true => {
                 // Idle 则忽略当前 poll
                 if self.stage.get() == Stage::Idle {
@@ -245,81 +252,126 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                         data: None,
                     });
                 }
-                // Poll pending future if Device is in ParameterSent stage and an INVOK is pending
-                if self.stage.get() == Stage::ParameterSent
-                    && self.role.get() == Role::Device
+                // 当设备有挂起的 INVOK 操作并且处于响应阶段时，轮询 Pollable
+                if self.role.get() == Role::Device
                     && self.device_op_pending.get()
-                        & (self.status.get() == Status::Other
-                            || (self.status.get() != Status::AwaitingAck
-                                && self.status.get() != Status::AwaitingErrAck))
+                    && self.stage.get() == Stage::SendingResponse
                 {
-                    let waker = futures_task::noop_waker_ref();
-                    let mut cx = Context::from_waker(waker);
+                    // 如果正在等待 AWAIT 的 ACK，则不轮询主 Pollable, ACK 超时机制处理 AWAIT 的重传
+                    if self.status.get() == Status::AwaitingAck {
+                        // Timeout for AWAIT's ACK will be handled by the generic timeout logic below.
+                    } else if self.status.get() == Status::AwaitingErrAck {
+                        // This state is unlikely if a device operation is pending normally.
+                        // Consider if an error should be raised or state reset.
+                    } else {
+                        // Status::Other, ready to poll the main INVOK pollable
+                        let mut pollable_store = self.pending_pollable.borrow_mut();
 
-                    let mut future_store = self.pending_future.borrow_mut();
-                    if let Some(pinned_future) = future_store.as_mut() {
-                        match pinned_future.as_mut().poll(&mut cx) {
-                            Poll::Ready(result) => {
-                                future_store.take(); // Remove completed future
-                                self.device_op_pending.set(false);
-                                self.device_await_deadline.set(None);
+                        if let Some(pinned_pollable) = pollable_store.as_mut() {
+                            match pinned_pollable.as_mut().poll() {
+                                Poll::Ready(result) => {
+                                    pollable_store.take(); // Remove completed pollable
+                                    self.device_op_pending.set(false);
+                                    self.device_await_deadline.set(None);
 
-                                match result {
-                                    Ok(data_opt) => {
-                                        self.data_return.replace(data_opt.unwrap_or_default());
-                                        self.stage.set(Stage::SendingResponse);
-                                        // status will be set by send() to AwaitingAck
-                                        self.sending_data_progress.set(0);
+                                    match result {
+                                        Ok(data_opt) => {
+                                            self.data_return.replace(data_opt.unwrap_or_default());
+                                            // Stage is already SendingResponse.
+                                            self.sending_data_progress.set(0); // Reset for sending return data.
 
-                                        let rturn_object_name = if self
-                                            .data_return
-                                            .borrow()
-                                            .is_empty()
-                                        {
-                                            Operation::Empty.to_name().to_string()
-                                        } else {
-                                            // For INVOK, RTURN object is the method name
-                                            self.root_object
-                                                .borrow()
-                                                .as_ref()
-                                                .cloned()
-                                                .unwrap_or_else(|| {
-                                                    // Fallback, though root_object should be set for INVOK
-                                                    self.root_operation.get().to_name().to_string()
-                                                })
-                                        };
-                                        // RTURN itself doesn't carry data in its DATA field.
-                                        // Data is sent via subsequent SDATA commands if rturn_object_name is not EMPTY.
+                                            let rturn_object_name =
+                                                if self.data_return.borrow().is_empty() {
+                                                    String::from("EMPTY")
+                                                } else {
+                                                    Operation::Invoke.to_name().to_string()
+                                                };
+                                            return send(Command {
+                                                msg_id: next_msg_id_for_send(),
+                                                operation: Operation::Return,
+                                                object: Some(rturn_object_name),
+                                                data: None,
+                                            });
+                                        }
+                                        Err(_) => {
+                                            reset_transaction_state();
+                                            return err("INVOK operation failed");
+                                        }
+                                    }
+                                }
+                                Poll::Pending => {
+                                    if Instant::now()
+                                        >= self
+                                            .device_await_deadline
+                                            .get()
+                                            .unwrap_or(Instant::now())
+                                    {
+                                        self.device_await_deadline
+                                            .set(Some(Instant::now() + self.config.await_interval));
                                         return send(Command {
                                             msg_id: next_msg_id_for_send(),
-                                            operation: Operation::Return,
-                                            object: Some(rturn_object_name),
+                                            operation: Operation::Await,
+                                            object: None,
                                             data: None,
                                         });
                                     }
-                                    Err(_) => {
-                                        // Future returned an error. Terminate transaction.
-                                        reset_transaction_state();
-                                        // log::error!("INVOK operation failed: {}", e_str); // Consider logging
-                                        return err("INVOK operation failed"); // Send generic PK error
-                                    }
                                 }
                             }
-                            Poll::Pending => {
-                                if Instant::now()
-                                    > self.device_await_deadline.get().unwrap_or(Instant::now())
-                                {
-                                    return send(Command {
-                                        msg_id: next_msg_id_for_send(),
-                                        operation: Operation::Await,
-                                        object: None,
-                                        data: None,
-                                    });
-                                }
-                            }
+                        } else {
+                            // device_op_pending is true, but no pollable.
+                            reset_transaction_state();
+                            return err("Internal: Device op pending but no pollable.");
                         }
-                    } else {
-                        return err("No pending future to poll");
+                    }
+                } // 结束 device_op_pending && Stage::SendingResponse 的处理
+                if self.device_should_return.get() {
+                    self.sending_data_progress.set(0); // 重置发送进度
+                    self.device_should_return.set(false);
+                    // 这时候的状态应该是收到了 QUERY，还没有发送返回值
+                    match self.root_operation.get() {
+                        Operation::GetVersion => {
+                            return send(Command {
+                                msg_id: next_msg_id_for_send(),
+                                operation: Operation::Return,
+                                object: Some(self.root_operation.get().to_name().to_string()),
+                                data: None,
+                            });
+                        }
+                        Operation::RequireVariable => {
+                            if self.data_return.borrow().len() == 0 {
+                                return send(Command {
+                                    msg_id: next_msg_id_for_send(),
+                                    operation: Operation::Return,
+                                    object: Some(String::from("EMPTY")),
+                                    data: None,
+                                });
+                            }
+                            return send(Command {
+                                msg_id: next_msg_id_for_send(),
+                                operation: Operation::Return,
+                                object: Some(self.root_operation.get().to_name().to_string()),
+                                data: None,
+                            });
+                        }
+                        Operation::SendVariable => {
+                            // SENDV doesn't return data in the RTURN command itself.
+                            // The result of the set operation is implicitly acknowledged by the ENDTR ACK.
+                            // If there was an error during set, it would be handled by the error path.
+                            // We still send RTURN EMPTY to signal the end of the Device's processing phase.
+                            self.data_return.replace(vec![]); // Ensure data_return is empty
+                            return send(Command {
+                                msg_id: next_msg_id_for_send(),
+                                operation: Operation::Return,
+                                object: Some(Operation::Empty.to_name().to_string()),
+                                data: None,
+                            });
+                        }
+                        Operation::Invoke => {
+                            // 忽略，因为 Invoke 的返回在上面轮询 Pollable 时处理
+                        }
+                        _ => {
+                            panic!("Not a root operation");
+                        }
                     }
                 }
 
@@ -333,8 +385,12 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                         }
                     }
                     _ => {
-                        // 不考虑 Idle 因为上面已经检查过了,没有等待 ACK 时则检查指令间超时
-                        if elapsed_ms >= self.config.inter_command_timeout {
+                        // 仅当不在 Idle 状态且没有挂起的设备操作时检查指令间超时
+                        if self.stage.get() != Stage::Idle
+                            && !self.device_op_pending.get()
+                            && elapsed_ms >= self.config.inter_command_timeout
+                        {
+                            reset_transaction_state(); // 在发送错误前重置状态
                             return err("Operation timed out");
                         }
                     }
@@ -467,9 +523,12 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                     return ack(recv.msg_id, recv.operation);
                                 } else if recv.operation == Operation::Data {
                                     self.stage.set(Stage::SendingParameter);
-                                    self.data_param.borrow_mut().append(&mut Vec::from(
-                                        recv.data.as_ref().unwrap().clone(),
-                                    ));
+                                    {
+                                        // 缩小可变借用的作用域，确保归还
+                                        self.data_param.borrow_mut().append(&mut Vec::from(
+                                            recv.data.as_ref().unwrap().clone(),
+                                        ));
+                                    }
                                     return ack(recv.msg_id, recv.operation);
                                 } else {
                                     return err("Should be EMPTY or DATA");
@@ -493,12 +552,17 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                 if recv.operation != Operation::Acknowledge {
                                     return err("Host expected ACKNO in SendingParameter stage");
                                 }
-                                self.status.set(Status::Other); // ACK received, status is clear before sending next command
+                                self.status.set(Status::Other);
 
-                                // 检查是对哪个指令的 ACKNO
-                                match self.last_sent_command.borrow().operation {
+                                // 将借用操作限制在最小作用域，以避免后续调用 send() 或 err() 时发生冲突
+                                let last_sent_op;
+                                {
+                                    last_sent_op = self.last_sent_command.borrow().operation;
+                                } // 不可变借用在此结束
+
+                                match last_sent_op {
                                     Operation::Empty => {
-                                        // 对 EMPTY 的 ACKNO，参数传输结束，发送 ENDTR
+                                        // 收到对 EMPTY 的 ACKNO，参数传输结束，发送 ENDTR
                                         self.stage.set(Stage::ParameterSent);
                                         return send(Command {
                                             msg_id: next_msg_id_for_send(),
@@ -508,7 +572,7 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                         });
                                     }
                                     Operation::Data => {
-                                        // 对 SDATA 的 ACKNO
+                                        // 收到对 SDATA 的 ACKNO
                                         let param_data_len = self.data_param.borrow().len() as u64;
                                         if self.sending_data_progress.get() < param_data_len {
                                             // 还有参数数据需要发送
@@ -520,7 +584,6 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                                         return err(e);
                                                     }
                                                 };
-                                            self.status.set(Status::AwaitingAck);
                                             return send(Command {
                                                 msg_id: next_msg_id_for_send(),
                                                 operation: Operation::Data,
@@ -689,12 +752,12 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                                 .method_accessor
                                                 .call(method_name, self.data_param.borrow().clone())
                                             {
-                                                Ok(future) => {
-                                                    self.pending_future.replace(Some(future));
+                                                Ok(pollable) => {
+                                                    self.pending_pollable.replace(Some(pollable));
                                                 }
                                                 Err(_) => {
                                                     reset_transaction_state();
-                                                    // log::error!("Failed to create INVOK future: {}", e_str);
+                                                    // log::error!("Failed to create INVOK pollable: {}", e_str);
                                                     return err(
                                                         "Failed to initiate INVOK operation",
                                                     );
@@ -706,6 +769,8 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                             return err("Not a root operation");
                                         }
                                     }
+                                    self.stage.set(Stage::SendingResponse);
+                                    self.device_should_return.set(true);
                                     return ack(recv.msg_id, recv.operation);
                                 }
                             }
@@ -715,8 +780,8 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                         }
                     }
                     Stage::SendingResponse => {
-                        /* Host -> 收到对 RETURN 的 ACK，开始接收数据。
-                        Device -> 收到对 QUERY 的 ACK，发送 RETURN。 */
+                        /* Host -> 接收数据。
+                        Device -> 收到对 RTURN/SDATA 的 ACK，继续发送数据或终止 */
                         match self.role.get() {
                             Role::Host => {
                                 // Host 等待 SDATA 或 ENDTR
@@ -728,12 +793,12 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                     return ack(recv.msg_id, recv.operation);
                                 } else if recv.operation == Operation::EndTransaction {
                                     let endtr_ack = ack(recv.msg_id, recv.operation);
-                                    // 收到 ENDTR，事务结束
-                                    reset_transaction_state();
+                                    self.stage.set(Stage::Idle);
+                                    self.status.set(Status::Other); // After sending ACK, status is Other
                                     return endtr_ack;
                                 } else {
                                     return err(
-                                        "Host expected DATA or ENDTR in SendingResponse stage",
+                                        "Host expected SDATA or ENDTR in SendingResponse stage",
                                     );
                                 }
                             }
@@ -742,12 +807,17 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
                                 if recv.operation != Operation::Acknowledge {
                                     return err("Device expected ACKNO in SendingResponse stage");
                                 }
-                                self.status.set(Status::Other); // ACK received, status is clear before sending next command
+                                self.status.set(Status::Other);
 
-                                // 检查是对哪个指令的 ACKNO
-                                match self.last_sent_command.borrow().operation {
+                                // 将借用操作限制在最小作用域
+                                let last_sent_op;
+                                {
+                                    last_sent_op = self.last_sent_command.borrow().operation;
+                                } // 不可变借用在此结束
+
+                                match last_sent_op {
                                     Operation::Return => {
-                                        // 对 RETURN 的 ACKNO
+                                        // 收到对 RETURN 的 ACKNO
                                         let return_data_len =
                                             self.data_return.borrow().len() as u64;
                                         if return_data_len == 0 {
@@ -888,6 +958,7 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
         self.sending_data_progress.set(0);
         self.device_op_pending.set(false);
         self.device_await_deadline.set(None);
+        self.pending_pollable.borrow_mut().take(); // Clear the pollable
     }
 
     /// Checks if the transaction is complete (i.e., the state machine is in the `Idle` stage).
@@ -921,18 +992,20 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
 
     /// Waits for the transaction to complete and then executes a callback with the return data.
     ///
-    /// This is a blocking or polling-based wait depending on how the surrounding code
-    /// calls `poll()`. The callback is only executed once the state machine enters the `Idle` stage.
+    /// This is a polling-based wait. The callback is only executed once the state machine enters the `Idle` stage.
     ///
     /// # Arguments
     /// * `callback`: A closure that takes an `Option<Vec<u8>>` (the return data) and is executed upon completion.
+    ///
+    /// # Returns
+    /// `true` if the callback was executed, or `false` otherwise
     ///
     /// # Note
     /// This method assumes `poll()` is being called externally to drive the state machine.
     /// It does not block the current thread waiting for completion, but rather checks the state
     /// and executes the callback if complete. You must ensure `poll()` is called frequently
     /// for the transaction to progress.
-    pub fn wait_for_complete_and<F>(&self, callback: F) -> ()
+    pub fn wait_for_complete_and<F>(&self, callback: F) -> bool
     where
         F: FnOnce(Option<Vec<u8>>) -> (),
     {
@@ -940,7 +1013,10 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
         if self.stage.get() == Stage::Idle {
             let data = self.data_return.borrow().clone();
             self.reset_transaction_state();
-            callback(if data.len() == 0 { None } else { Some(data) })
+            callback(if data.len() == 0 { None } else { Some(data) });
+            true
+        } else {
+            false
         }
     }
 
@@ -982,7 +1058,8 @@ impl<VA: PkVariableAccessor, MA: PkMethodAccessor> PkCommand<VA, MA> {
             config,
             variable_accessor,
             method_accessor,
-            pending_future: RefCell::new(None),
+            pending_pollable: RefCell::new(None),
+            device_should_return: Cell::new(false),
         }
     }
 }

@@ -1,5 +1,9 @@
-use std::future::Future;
-use std::{cell::RefCell, pin::Pin};
+use crate::Pollable;
+use std::{
+    cell::RefCell,
+    pin::Pin,
+    sync::{Arc, RwLock},
+};
 
 /// Module for handling PK Command Message IDs.
 pub mod msg_id {
@@ -66,6 +70,50 @@ pub mod msg_id {
     pub fn increment(id: u16) -> u16 {
         (id + 1) % (MAX_ID + 1)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_msg_id_to_u16_valid() {
+            assert_eq!(to_u16("!!"), Ok(0));
+            assert_eq!(to_u16("!\""), Ok(1));
+            assert_eq!(to_u16("\"!"), Ok(BASE));
+            assert_eq!(to_u16("~~"), Ok(MAX_ID));
+        }
+
+        #[test]
+        fn test_msg_id_to_u16_invalid_length() {
+            assert!(to_u16("!").is_err());
+            assert!(to_u16("!!!").is_err());
+        }
+
+        #[test]
+        fn test_msg_id_to_u16_invalid_chars() {
+            assert!(to_u16(" !").is_err()); // Space is not allowed
+        }
+
+        #[test]
+        fn test_msg_id_from_u16_valid() {
+            assert_eq!(from_u16(0), Ok("!!".to_string()));
+            assert_eq!(from_u16(1), Ok("!\"".to_string()));
+            assert_eq!(from_u16(BASE), Ok("\"!".to_string()));
+            assert_eq!(from_u16(MAX_ID), Ok("~~".to_string()));
+        }
+
+        #[test]
+        fn test_msg_id_from_u16_out_of_range() {
+            assert!(from_u16(MAX_ID + 1).is_err());
+        }
+
+        #[test]
+        fn test_msg_id_increment() {
+            assert_eq!(increment(0), 1);
+            assert_eq!(increment(MAX_ID), 0); // Rollover
+            assert_eq!(increment(100), 101);
+        }
+    }
 }
 
 /// A wrapper for `std::collections::HashMap` that implements the `PkVariableAccessor` trait.
@@ -100,7 +148,7 @@ impl PkVHashmapWrapper {
     ///     - `Box<dyn Fn(Vec<u8>) -> ()>`: A listener function called when the variable is set.
     ///
     /// **IMPORTANT**: The listener passed in here is synchronously executed and may block the main thread (where `PkCommand::poll()` is executed).
-    /// Use with caution or create a new thread if the listener is going to do something very costly
+    /// Use with caution or create a new thread if the listener is going to do something very costly.
     pub fn new(init_vec: Vec<(String, Option<Vec<u8>>, Box<dyn Fn(Vec<u8>) -> ()>)>) -> Self {
         let mut hashmap = std::collections::HashMap::new();
         for i in init_vec.into_iter() {
@@ -110,25 +158,16 @@ impl PkVHashmapWrapper {
         PkVHashmapWrapper { hashmap }
     }
 }
+
 /// A wrapper for `std::collections::HashMap` that implements the `PkMethodAccessor` trait.
 pub struct PkMHashmapWrapper {
     // 这是一个实现了 PkMethodAccessor trait 的 Hashmap 包装器，
-    hashmap: std::collections::HashMap<
-        String,
-        Box<
-            dyn Fn(
-                Option<Vec<u8>>,
-            ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>,
-        >,
-    >,
+    hashmap:
+        std::collections::HashMap<String, Box<dyn Fn(Option<Vec<u8>>) -> Pin<Box<dyn Pollable>>>>,
 }
 
 impl crate::PkMethodAccessor for PkMHashmapWrapper {
-    fn call(
-        &self,
-        key: String,
-        param: Vec<u8>,
-    ) -> Result<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>, String> {
+    fn call(&self, key: String, param: Vec<u8>) -> Result<Pin<Box<dyn Pollable>>, String> {
         if self.hashmap.contains_key(&key) {
             let f = self.hashmap.get(&key).unwrap();
             Ok(f(Some(param)))
@@ -144,17 +183,12 @@ impl PkMHashmapWrapper {
     /// # Arguments
     /// * `init_vec`: A vector of tuples, where each tuple contains:
     ///     - `String`: The method key (name).
-    ///     - `Box<dyn Fn(Option<Vec<u8>>) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>>`:
-    ///       A function that takes optional parameters and returns a pinned, boxed future representing the method call.
+    ///     - `Box<dyn Fn(Option<Vec<u8>>) -> Pin<Box<dyn Pollable>> `:
+    ///       A function that takes optional parameters and returns a pinned, boxed `Pollable` representing the method call.
     pub fn new(
         init_vec: Vec<(
             String,
-            Box<
-                dyn Fn(
-                    Option<Vec<u8>>,
-                )
-                    -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>>>>,
-            >,
+            Box<dyn Fn(Option<Vec<u8>>) -> Pin<Box<dyn Pollable>>>,
         )>,
     ) -> Self {
         let mut hashmap = std::collections::HashMap::new();
@@ -163,5 +197,57 @@ impl PkMHashmapWrapper {
             hashmap.insert(key, method);
         }
         PkMHashmapWrapper { hashmap }
+    }
+}
+
+/// A simple implementation of `Pollable` based on multi-thread.
+///
+/// This is like `Promise` in JavaScript.
+#[derive(Clone)]
+pub struct PkPollable {
+    return_value: Arc<RwLock<Option<Vec<u8>>>>,
+}
+impl PkPollable {
+    /// Creates a new `PkPollable` and executes a function in a new thread.
+    ///
+    /// The provided function `function` will be executed in a separate thread.
+    /// It receives a `resolve` closure as an argument. The user's function
+    /// should call this `resolve` closure with the result data (`Vec<u8>`)
+    /// when the asynchronous operation is complete.
+    ///
+    /// # Arguments
+    /// * `function`: A closure that takes a `resolve` closure and performs the
+    ///   asynchronous task. The `resolve` closure should be called with the
+    ///   result data when the task finishes successfully.
+    ///
+    /// # Returns
+    /// A new `PkPollable` instance that can be polled to check the status
+    /// of the asynchronous operation.
+    pub fn execute<T>(function: T) -> Pin<Box<Self>>
+    where
+        T: FnOnce(Box<dyn FnOnce(Vec<u8>) -> () + Send + 'static>) + Send + 'static,
+    {
+        let return_value_arc = Arc::new(RwLock::new(None));
+        let return_value_clone = return_value_arc.clone();
+        std::thread::spawn(move || {
+            let resolve: Box<dyn FnOnce(Vec<u8>) -> () + Send + 'static> =
+                Box::new(move |ret: Vec<u8>| {
+                    // This resolve function is called by the user's function
+                    *return_value_clone.write().unwrap() = Some(ret);
+                });
+            function(Box::new(resolve));
+        });
+        Box::pin(PkPollable {
+            return_value: return_value_arc,
+        })
+    }
+}
+impl Pollable for PkPollable {
+    fn poll(&self) -> std::task::Poll<Result<Option<Vec<u8>>, String>> {
+        let read_guard = self.return_value.read().unwrap();
+        match read_guard.as_ref() {
+            Some(data) => std::task::Poll::Ready(Ok(Some(data.clone()))),
+            None => std::task::Poll::Pending,
+        }
     }
 }

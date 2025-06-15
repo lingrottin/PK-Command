@@ -1,7 +1,7 @@
 use crate::util::msg_id;
 
 /// Defines the set of operations supported by the PK Command protocol.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Operation {
     SendVariable,    // SENDV
     RequireVariable, // REQUV
@@ -82,7 +82,7 @@ pub enum Role {
 }
 
 /// Represents a parsed or to-be-sent PK Command.
-#[derive(Clone)]
+#[derive(PartialEq, Clone, Debug)]
 pub struct Command {
     pub msg_id: u16,
     pub operation: Operation,
@@ -251,7 +251,7 @@ impl Command {
             )
             .as_bytes()
             .to_vec();
-            vec.push(20);
+            vec.push(b' ');
             vec.append(&mut self.data.clone().unwrap());
             vec
         }
@@ -320,4 +320,127 @@ pub enum Stage {
     SendingParameter,      // 正在传输参数
     ParameterSent,         // 已传输第一个“ENDTR”，等待 QUERY
     SendingResponse,       // 正在传输返回值
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::msg_id;
+
+    #[test]
+    fn test_command_parse_valid_simple() {
+        let bytes = b"!!START";
+        let cmd = Command::parse(bytes).unwrap();
+        assert_eq!(cmd.msg_id, 0);
+        assert_eq!(cmd.operation, Operation::Start);
+        assert!(cmd.object.is_none());
+        assert!(cmd.data.is_none());
+    }
+
+    #[test]
+    fn test_command_parse_valid_with_object() {
+        let bytes = b"!\"SENDV VARIA";
+        let cmd = Command::parse(bytes).unwrap();
+        assert_eq!(cmd.msg_id, msg_id::to_u16("!\"").unwrap());
+        assert_eq!(cmd.operation, Operation::SendVariable);
+        assert_eq!(cmd.object, Some("VARIA".to_string()));
+        assert!(cmd.data.is_none());
+    }
+
+    #[test]
+    fn test_command_parse_valid_with_object_and_data() {
+        let bytes = b"!#SENDV VARIA data_payload";
+        let cmd = Command::parse(bytes).unwrap();
+        assert_eq!(cmd.msg_id, msg_id::to_u16("!#").unwrap());
+        assert_eq!(cmd.operation, Operation::SendVariable);
+        assert_eq!(cmd.object, Some("VARIA".to_string()));
+        assert_eq!(cmd.data, Some(b"data_payload".to_vec()));
+    }
+
+    #[test]
+    fn test_command_parse_error_command() {
+        let bytes = b"  ERROR ERROR Some error description";
+        let cmd = Command::parse(bytes).unwrap();
+        assert_eq!(cmd.msg_id, 0);
+        assert_eq!(cmd.operation, Operation::Error);
+        assert_eq!(cmd.object, Some("ERROR".to_string()));
+        assert_eq!(cmd.data, Some(b"Some error description".to_vec()));
+    }
+
+    #[test]
+    fn test_command_parse_ackno_error_command() {
+        let bytes = b"  ACKNO ERROR";
+        let cmd = Command::parse(bytes).unwrap();
+        assert_eq!(cmd.msg_id, 0);
+        assert_eq!(cmd.operation, Operation::Acknowledge);
+        assert_eq!(cmd.object, Some("ERROR".to_string()));
+        assert!(cmd.data.is_none());
+    }
+
+    #[test]
+    fn test_command_parse_invalid_error_msg_id() {
+        // space msg_id's are only allowed in ERROR and ACKNO ERROR commands
+        let byetes = b"  START";
+        let result = Command::parse(byetes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_command_parse_invalid_too_short() {
+        // assert_eq!(
+        //     Command::parse(b"!!STA"),
+        //     Err("Invalid length: message is too short.")
+        // );
+        let result = Command::parse(b"!!STA");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Invalid length: message is too short.");
+    }
+
+    #[test]
+    fn test_command_parse_invalid_msg_id() {
+        // LF(0x0A) and CR(0x0D) is not in the charset
+        let result = Command::parse(b"\n\rSTART");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Invalid MSG ID format.");
+    }
+
+    #[test]
+    fn test_command_to_bytes_simple() {
+        let cmd = Command {
+            msg_id: 0,
+            operation: Operation::Start,
+            object: None,
+            data: None,
+        };
+        assert_eq!(cmd.to_bytes(), b"!!START".to_vec());
+    }
+
+    #[test]
+    fn test_command_to_bytes_with_object_and_data() {
+        let cmd = Command {
+            msg_id: msg_id::to_u16("!#").unwrap(),
+            operation: Operation::SendVariable,
+            object: Some("VARIA".to_string()),
+            data: Some(b"payload".to_vec()),
+        };
+
+        let mut expected = b"!#SENDV VARIA".to_vec();
+        expected.push(b' ');
+        expected.extend_from_slice(b"payload");
+        assert_eq!(cmd.to_bytes(), expected);
+    }
+
+    #[test]
+    fn test_command_to_bytes_error() {
+        let cmd = Command {
+            msg_id: 0, // msg_id is ignored for ERROR
+            operation: Operation::Error,
+            object: Some("ERROR".to_string()),
+            data: Some(b"Test error".to_vec()),
+        };
+        let mut expected = b"  ERROR ERROR".to_vec();
+        expected.push(b' ');
+        expected.extend_from_slice(b"Test error");
+        assert_eq!(cmd.to_bytes(), expected);
+    }
 }

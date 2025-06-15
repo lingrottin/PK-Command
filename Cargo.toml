@@ -1,7 +1,9 @@
 [package]
 name = "pk-command"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
-
-[dependencies]
-futures-task = "0.3.31"
+license = "MIT"
+description = "A communication protocol designed for embedded devices"
+homepage = "https://github.com/lingrottin/PK-Command"
+repository = "https://github.com/lingrottin/PK-Command.git"
+documentation = "https://docs.rs/pk-command"
