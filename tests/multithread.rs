@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod pk_command_integration_tests {
     use std::sync::mpsc::channel;
     use std::thread;
@@ -27,8 +28,11 @@ mod pk_command_integration_tests {
                 // In our test case, Host literally has no method or variable
                 let var_accessor = PkHashmapVariable::new(vec![]);
                 let method_accessor = PkHashmapMethod::new(vec![]);
-                let host_pkc =
-                    PkCommand::new(PkCommandConfig::default(64), var_accessor, method_accessor);
+                let host_pkc = PkCommand::<_, _, std::time::Instant>::new(
+                    PkCommandConfig::default(64),
+                    var_accessor,
+                    method_accessor,
+                );
 
                 host_pkc
                     .perform(operation, object.clone(), data)
@@ -129,8 +133,11 @@ mod pk_command_integration_tests {
                         }),
                     ),
                 ]);
-                let device_pkc =
-                    PkCommand::new(PkCommandConfig::default(64), var_accessor, method_accessor);
+                let device_pkc = PkCommand::<_, _, std::time::Instant>::new(
+                    PkCommandConfig::default(64),
+                    var_accessor,
+                    method_accessor,
+                );
 
                 for i in 0..10000 {
                     match device_rx.try_recv() {
@@ -260,6 +267,18 @@ mod pk_command_integration_tests {
             Some(String::from("LONGO")),
             None,
             Box::from(|data| assert_eq!(data, b"long_op_done")),
+        );
+    }
+
+    #[test]
+    fn test_get_version_simulation() -> () {
+        threads_simulation(
+            PkOperation::GetVersion,
+            None,
+            None,
+            Box::from(|data| {
+                assert_eq!(data, Vec::from(env!("CARGO_PKG_VERSION").as_bytes()));
+            }),
         );
     }
 }

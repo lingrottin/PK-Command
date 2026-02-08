@@ -1,76 +1,165 @@
+//!
+//! This module defines the core data structures and types used in the PK Command protocol implementation.
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+extern crate core as std;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+
 use crate::util::msg_id;
 
 /// Defines the set of operations supported by the PK Command protocol.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Operation {
-    SendVariable,    // SENDV
-    RequireVariable, // REQUV
-    Invoke,          // INVOK
-    GetVersion,      // PKVER
-    Start,           // START
-    EndTransaction,  // ENDTR
-    Acknowledge,     // ACKNO
-    Query,           // QUERY
-    Return,          // RTURN
-    Empty,           // EMPTY
-    Data,            // SDATA
-    Await,           // AWAIT
-    Error,           // ERROR
+    /// To set a variable's value on the device.
+    ///
+    /// 5-character name: `SENDV`
+    SendVariable,
+
+    /// To get a variable's value from the device.
+    ///
+    /// 5-character name: `REQUV`
+    RequireVariable,
+
+    /// To invoke a method on the device.
+    ///
+    /// 5-character name: `INVOK`
+    Invoke,
+
+    /// To get the version of the PK Command processor on the device.
+    ///
+    /// 5-character name: `PKVER`
+    GetVersion,
+
+    /// To indicate the start of a transaction chain.
+    ///
+    /// This is used internally by the [`poll`](crate::PkCommand::poll) method to manage transaction stages
+    /// and usually should not be used directly.
+    ///
+    /// 5-character name: `START`
+    Start,
+
+    /// To indicate the end of a transaction chain.
+    ///
+    /// This is used internally by the [`poll`](crate::PkCommand::poll) method to manage transaction stages
+    /// and usually should not be used directly.
+    ///
+    /// 5-character name: `ENDTR`
+    EndTransaction,
+
+    /// To acknowledge the receipt of a command.
+    ///
+    /// This is used internally by the state machine to manage acknowledgment status and usually should not be used directly.
+    ///
+    /// 5-character name: `ACKNO`
+    Acknowledge,
+
+    /// To request the outbound data from the device.
+    ///
+    /// This is used internally by the state machine to manage transaction stages and usually should not be used directly.
+    ///
+    /// 5-character name: `QUERY`
+    Query,
+
+    /// To return the response data from the device to the host.
+    ///
+    /// This is used internally by the state machine to manage transaction stages and usually should not be used directly.
+    ///
+    /// 5-character name: `RTURN`
+    Return,
+
+    /// To indicate that the current transaction phase has no data.
+    ///
+    /// This is used internally by the state machine to manage transaction stages and usually should not be used directly.
+    ///
+    /// 5-character name: `EMPTY`
+    Empty,
+
+    /// To send a chunk of data.
+    ///
+    /// This is used internally by the state machine to manage transaction stages and usually should not be used directly.
+    ///
+    /// 5-character name: `SDATA`
+    Data,
+
+    /// To indicate that the device is still processing and the transaction should be kept alive.
+    ///
+    /// This is used internally by the state machine to manage transaction stages and usually should not be used directly.
+    ///
+    /// 5-character name: `AWAIT`
+    Await,
+
+    /// To indicate an error occurred during transaction processing.
+    ///
+    /// This is used internally by the state machine to manage error handling and usually should not be used directly.
+    ///
+    /// 5-character name: `ERROR`
+    Error,
 }
 
 impl Operation {
     /// Returns the 5-character string representation of the operation.
     pub fn to_name(&self) -> &'static str {
+        use Operation::*;
         match self {
-            Operation::SendVariable => "SENDV",
-            Operation::RequireVariable => "REQUV",
-            Operation::Invoke => "INVOK",
-            Operation::GetVersion => "PKVER",
-            Operation::Start => "START",
-            Operation::EndTransaction => "ENDTR",
-            Operation::Acknowledge => "ACKNO",
-            Operation::Query => "QUERY",
-            Operation::Return => "RTURN",
-            Operation::Empty => "EMPTY",
-            Operation::Data => "SDATA",
-            Operation::Await => "AWAIT",
-            Operation::Error => "ERROR",
+            SendVariable => "SENDV",
+            RequireVariable => "REQUV",
+            Invoke => "INVOK",
+            GetVersion => "PKVER",
+            Start => "START",
+            EndTransaction => "ENDTR",
+            Acknowledge => "ACKNO",
+            Query => "QUERY",
+            Return => "RTURN",
+            Empty => "EMPTY",
+            Data => "SDATA",
+            Await => "AWAIT",
+            Error => "ERROR",
         }
     }
 
     /// Creates an `Operation` from its 5-character string representation.
     pub fn from_name(name: &str) -> Option<Operation> {
+        use Operation::*;
         match name {
-            "SENDV" => Some(Operation::SendVariable),
-            "REQUV" => Some(Operation::RequireVariable),
-            "INVOK" => Some(Operation::Invoke),
-            "PKVER" => Some(Operation::GetVersion),
-            "START" => Some(Operation::Start),
-            "ENDTR" => Some(Operation::EndTransaction),
-            "ACKNO" => Some(Operation::Acknowledge),
-            "QUERY" => Some(Operation::Query),
-            "RTURN" => Some(Operation::Return),
-            "EMPTY" => Some(Operation::Empty),
-            "SDATA" => Some(Operation::Data),
-            "AWAIT" => Some(Operation::Await),
-            "ERROR" => Some(Operation::Error),
+            "SENDV" => Some(SendVariable),
+            "REQUV" => Some(RequireVariable),
+            "INVOK" => Some(Invoke),
+            "PKVER" => Some(GetVersion),
+            "START" => Some(Start),
+            "ENDTR" => Some(EndTransaction),
+            "ACKNO" => Some(Acknowledge),
+            "QUERY" => Some(Query),
+            "RTURN" => Some(Return),
+            "EMPTY" => Some(Empty),
+            "SDATA" => Some(Data),
+            "AWAIT" => Some(Await),
+            "ERROR" => Some(Error),
             _ => None,
         }
     }
 
     /// Checks if the operation is a "root operation" that can initiate a transaction chain.
     pub fn is_root(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Operation::SendVariable
-            | Operation::RequireVariable
-            | Operation::Invoke
-            | Operation::GetVersion => true,
-            _ => false,
-        }
+                | Operation::RequireVariable
+                | Operation::Invoke
+                | Operation::GetVersion
+        )
     }
 }
 
 /// Defines the role of a participant in a PK Command transaction.
+///
+/// This is used internally by the state machine to manage transaction flow and usually should not be used directly.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Role {
     /// The initiator of the transaction.
@@ -82,24 +171,35 @@ pub enum Role {
 }
 
 /// Represents a parsed or to-be-sent PK Command.
+///
+/// A command consists of a 2-character base-94 `msg_id`, a 5-character `operation`,
+/// an optional 5-character `object`, and optional variable-length `data`.
 #[derive(PartialEq, Clone, Debug)]
 pub struct Command {
+    /// The numeric message ID (0-8835).
     pub msg_id: u16,
+    /// The operation to be performed.
     pub operation: Operation,
+    /// The target object of the operation (e.g., variable or method name).
     pub object: Option<String>,
+    /// Optional payload data.
     pub data: Option<Vec<u8>>,
 }
 
 impl Command {
-    /// Parses a byte slice into a `Command` struct.
+    /// Parses a byte slice into a [`Command`] struct.
     ///
-    /// The byte slice is expected to conform to the PK Command protocol format.
+    /// The input must follow the protocol format: `[ID][OP] [OBJ] [DATA]`.
     ///
     /// # Arguments
-    /// * `msg_bytes`: A byte slice representing the raw command.
+    /// * `msg_bytes`: The raw bytes received from the transport layer.
     ///
     /// # Returns
-    /// A `Result` containing the parsed `Command` or a static string slice describing the error.
+    /// A [`Result`] containing the parsed [`Command`] or an error message.
+    ///
+    /// # Errors
+    /// Returns an error if the byte slice is not a valid PK Command. (For example, the length is too short, the MSG ID is invalid,
+    /// or the operation name is unrecognized.)
     pub fn parse(msg_bytes: &[u8]) -> Result<Command, &'static str> {
         // 1. 检查最小长度
         if msg_bytes.len() < 7 {
@@ -206,10 +306,37 @@ impl Command {
         })
     }
 
-    /// Serializes the `Command` struct into a `Vec<u8>` according to the PK Command protocol format.
+    /// Serializes the [`Command`] into a [`Vec<u8>`] for transmission.
+    ///
+    /// This method ensures the output matches the fixed-length field requirements
+    /// of the PK Command protocol.
     ///
     /// # Panics
-    /// Panics if `self.msg_id` is invalid and cannot be converted by `msg_id::from_u16` (should not happen with valid IDs).
+    /// Panics if the `msg_id` is out of the valid 0-8835 range.
+    /// This usually indicates a tragic programming error.
+    ///
+    /// # Examples
+    /// ```
+    /// use pk_command::types::{Command, Operation};
+    /// let cmd = Command {
+    ///     msg_id: 2,
+    ///     operation: Operation::SendVariable,
+    ///     object: Some("VARIA".to_string()),
+    ///     data: Some(b"payload".to_vec()),
+    /// };
+    /// assert_eq!(cmd.to_bytes(), b"!#SENDV VARIA payload".to_vec());
+    /// ```
+    ///
+    /// ```should_panic
+    /// use pk_command::types::{Command, Operation};
+    /// let cmd = Command {
+    ///     msg_id: 9000, // Invalid MSG ID (greater than 8835)
+    ///     operation: Operation::SendVariable,
+    ///     object: Some("VARIA".to_string()),
+    ///     data: Some(b"payload".to_vec()),
+    /// };
+    /// cmd.to_bytes(); // This should panic due to invalid MSG ID
+    /// ```
     pub fn to_bytes(&self) -> Vec<u8> {
         let id = match self.operation {
             Operation::Error => String::from("  "),
@@ -259,6 +386,44 @@ impl Command {
 }
 
 impl std::fmt::Display for Command {
+    /// Formats the command for debugging or logging purposes.
+    ///
+    /// The output mimics the protocol format, but ensures non-printable data is handled gracefully.
+    ///
+    /// # Example
+    /// ```
+    /// use pk_command::types::{Command, Operation};
+    /// let cmd = Command {
+    ///     msg_id: 0,
+    ///     operation: Operation::Error,
+    ///     object: Some("ERROR".to_string()),
+    ///     data: Some(b"Some error description".to_vec()),
+    /// };
+    /// assert_eq!(format!("{}", cmd), "  ERROR ERROR Some error description");
+    ///
+    /// let cmd_non_printable = Command {
+    ///     msg_id: 1145,
+    ///     operation: Operation::Data,
+    ///     object: Some("QUERY".to_string()),
+    ///     data: Some(vec![0xFF, 0x00, 0xAB]),
+    /// };
+    ///
+    /// // "-2" is the base-94 encoding of 1145, and the data is non-printable,
+    /// // so it should show as "<BINARY DATA>".
+    /// assert_eq!(
+    ///     format!("{}", cmd_non_printable),
+    ///     "-2SDATA QUERY <BINARY DATA: 3 bytes>"
+    /// );
+    ///
+    /// let cmd_utf8 = Command {
+    ///     msg_id: 1145,
+    ///     operation: Operation::Data,
+    ///     object: Some("QUERY".to_string()),
+    ///     data: Some("汉字🐼".as_bytes().to_vec()),
+    /// };
+    /// // The data is valid UTF-8, so it should be displayed as is.
+    /// assert_eq!(format!("{}", cmd_utf8), "-2SDATA QUERY 汉字🐼");
+    /// ```
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let id = match self.operation {
             Operation::Error => String::from("  "),
@@ -280,46 +445,48 @@ impl std::fmt::Display for Command {
         if let Some(obj) = &self.object {
             write!(f, " {}", obj)?;
             if let Some(data_vec) = &self.data {
-                // 对于 ERROR 命令, data 应该是 UTF-8 描述字符串.
-                // 对于 SDATA 命令, data可能是任意二进制. String::from_utf8_lossy 在这里用于显示目的.
-                // 如果需要严格的二进制到文本的转换 (例如 Base64), 应该在这里实现.
-                let data_to_display = if self.operation == Operation::Error
-                    || !data_vec.iter().any(|&b| b == 0 || b > 127)
-                {
-                    String::from_utf8_lossy(data_vec)
+                #[cfg(not(feature = "std"))]
+                use alloc::str::from_utf8;
+                #[cfg(feature = "std")]
+                use std::str::from_utf8;
+
+                if let Ok(data) = from_utf8(data_vec) {
+                    write!(f, " {}", data)?;
                 } else {
-                    String::from_utf8_lossy(data_vec) // 或者如: format!("<BINARY DATA: {} bytes>", data_vec.len())
+                    write!(f, " <BINARY DATA: {} bytes>", data_vec.len())?;
                 };
-                write!(f, " {}", data_to_display)?;
             }
         }
-
         Ok(())
     }
 }
 
-/// Indicates the specific status of the command sender/receiver regarding acknowledgments.
-// 指示当前收发指令方的特定状态
+/// Indicates the current acknowledgment status of the participant.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Status {
-    /// Not currently awaiting an acknowledgment.
-    Other, // 没有等待 ACK
-    /// Awaiting a standard acknowledgment (`ACKNO`).
-    AwaitingAck, // 等待 ACK
-    /// Awaiting an acknowledgment for a sent `ERROR` command.
-    AwaitingErrAck, // 等待 ACK（发送 ERROR 后）
+    /// Normal state, not awaiting any acknowledgment.
+    Other,
+    /// Currently waiting for a standard `ACKNO` to be received.
+    AwaitingAck,
+    /// Currently waiting for an acknowledgment to an `ERROR` packet.
+    AwaitingErrAck,
 }
 
-/// Indicates the current stage of a transaction chain.
-// 指示当前“链”的状态（传输阶段）
+/// Defines the high-level stages of a PK Command transaction chain.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Stage {
+    /// No transaction is currently active.
     Idle,
-    Started,               // 已发出/收到 START 指令
-    RootOperationAssigned, // 已发出/收到根指令,等待发送参数
-    SendingParameter,      // 正在传输参数
-    ParameterSent,         // 已传输第一个“ENDTR”，等待 QUERY
-    SendingResponse,       // 正在传输返回值
+    /// A `START` command has been sent or received.
+    Started,
+    /// The root operation (e.g., `SENDV`) has been established.
+    RootOperationAssigned,
+    /// Parameter data is currently being transferred via `SDATA` or `EMPTY`.
+    SendingParameter,
+    /// All parameters have been sent, and the transaction is awaiting a `QUERY` or processing.
+    ParameterSent,
+    /// The response/return data is currently being transferred.
+    SendingResponse,
 }
 
 #[cfg(test)]
@@ -380,8 +547,8 @@ mod tests {
     #[test]
     fn test_command_parse_invalid_error_msg_id() {
         // space msg_id's are only allowed in ERROR and ACKNO ERROR commands
-        let byetes = b"  START";
-        let result = Command::parse(byetes);
+        let bytes = b"  START";
+        let result = Command::parse(bytes);
         assert!(result.is_err());
     }
 

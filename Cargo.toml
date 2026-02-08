@@ -1,10 +1,47 @@
 [package]
 name = "pk-command"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "MIT"
 description = "A communication protocol designed for embedded devices"
 homepage = "https://github.com/lingrottin/PK-Command"
 repository = "https://github.com/lingrottin/PK-Command.git"
 documentation = "https://docs.rs/pk-command"
-exclude = [".github/", "Specification.md", "Specification_zh.md"]
+exclude = [".github/", "Specification.md", "Specification_zh.md", "Cargo.lock"]
+
+[features]
+default = ["std"]
+std = []
+embassy = ["embassy-time", "embassy-runtime"]
+embassy-runtime = ["embassy-executor", "embassy-sync"]
+tokio-runtime = ["tokio/rt", "std"]
+smol-runtime = ["smol", "async-channel", "std"]
+tokio-runtime-test = [
+  "tokio-runtime",
+  "tokio/sync",
+  "tokio/time",
+  "tokio/macros",
+]
+embassy-runtime-test = [
+  "embassy",
+  "embassy-executor/arch-std",
+  "embassy-executor/executor-thread",
+  "embassy-time/std",
+  "static_cell",
+]
+doc = []
+
+[dependencies]
+embassy-time = { version = "0.5.0", optional = true }
+tokio = { version = "1.43", optional = true }
+smol = { version = "1.3", optional = true }
+async-channel = { version = "1.8", optional = true }
+embassy-executor = { version = "0.9.1", optional = true }
+embassy-sync = { version = "0.7.2", optional = true }
+static_cell = { version = "2.1.1", optional = true }
+
+[dev-dependencies]
+critical-section = { version = "1.2", features = ["std"] }
+
+[package.metadata.docs.rs]
+all-features = true
