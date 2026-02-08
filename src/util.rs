@@ -358,6 +358,8 @@ pub mod async_adapters {
 
         // Typically `std` is not available here
         extern crate alloc;
+        use alloc::boxed::Box;
+        use alloc::string::String;
         use alloc::sync::Arc;
         use alloc::vec::Vec;
         use embassy_sync::once_lock::OnceLock;

@@ -1,5 +1,8 @@
-#![cfg(all(feature = "embassy", feature = "embassy-runtime-test"))]
+#![cfg(all(feature = "std", feature = "embassy", feature = "embassy-runtime-test"))]
 #![cfg(test)]
+
+// Although embassy is typically used in no_std environments,
+// the test here run in std.
 
 use embassy_executor::Executor;
 use embassy_time::Timer;
